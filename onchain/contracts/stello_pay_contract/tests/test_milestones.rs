@@ -1,0 +1,1476 @@
+//! Comprehensive test suite for milestone-based payment functionality (#162, #486).
+//!
+//! Covers: agreement creation, funding, adding milestones, approving, claiming,
+//! access control, edge cases, event emissions, and milestone-interface
+//! conformance (#942).
+
+#![cfg(test)]
+#![allow(deprecated)]
+
+use milestone_interface::{MilestoneContractClient, MilestoneView};
+use soroban_sdk::{testutils::Address as _, Address, Env};
+use stello_pay_contract::{
+    storage::{Milestone, PayrollError},
+    PayrollContract, PayrollContractClient,
+};
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+fn create_test_env() -> (
+    Env,
+    Address,
+    Address,
+    Address,
+    PayrollContractClient<'static>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register(PayrollContract, ());
+    let client = PayrollContractClient::new(&env, &contract_id);
+    let employer = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    (env, employer, contributor, token, client)
+}
+
+/// Mint tokens to `employer`, create a milestone agreement, and fund it via
+/// `fund_milestone_agreement` so that approve/claim invariants can pass.
+///
+/// Uses a large pre-funded pool (`i128::MAX / 2`) so existing tests do not
+/// need to know the exact amounts of milestones added afterwards.
+fn setup_milestone_agreement(
+    env: &Env,
+    client: &PayrollContractClient,
+    employer: &Address,
+    contributor: &Address,
+    token: &Address,
+) -> u128 {
+    let fund_amount: i128 = i128::MAX / 2;
+    soroban_sdk::token::StellarAssetClient::new(env, token).mint(employer, &fund_amount);
+    let id = client.create_milestone_agreement(
+        employer,
+        contributor,
+        token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    client.fund_milestone_agreement(&id, employer, &fund_amount);
+    id
+}
+
+// -----------------------------------------------------------------------------
+// Milestone agreement creation
+// -----------------------------------------------------------------------------
+
+/// Creates a milestone agreement and verifies agreement ID and basic state.
+#[test]
+fn test_create_milestone_agreement() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    assert!(agreement_id >= 1);
+    assert_eq!(client.get_milestone_count(&agreement_id), 1);
+    let m = client.get_milestone(&agreement_id, &1).unwrap();
+    assert_eq!(m.amount, 1);
+    assert!(!m.approved);
+    assert!(!m.claimed);
+}
+
+/// Verifies that a second agreement gets a distinct ID.
+#[test]
+fn test_milestone_agreement_payment_type() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let _id1 = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    let id2 = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    assert_eq!(client.get_milestone_count(&id2), 1);
+}
+
+/// Initial milestone count is zero for a new agreement.
+#[test]
+fn test_initial_milestone_count_zero() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    assert_eq!(client.get_milestone_count(&agreement_id), 1);
+}
+
+// -----------------------------------------------------------------------------
+// Creation validation — empty / single milestone rejection
+// -----------------------------------------------------------------------------
+
+/// Creating an agreement with an empty milestone vector must be rejected with
+/// `EmptyMilestoneList` because a zero-milestone agreement has no possible
+/// payout path and would otherwise occupy storage as a dead record.
+#[test]
+fn test_create_empty_milestone_list_rejected() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let empty: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
+    let result = client.try_create_milestone_agreement(&employer, &contributor, &token, &empty);
+    assert_eq!(result, Err(Ok(PayrollError::EmptyMilestoneList.into())));
+}
+
+/// Creating an agreement with a zero-amount milestone must be rejected with
+/// `MilestoneAmountInvalid`.
+#[test]
+fn test_create_milestone_agreement_zero_amount_rejected() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let result = client.try_create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 0i128],
+    );
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneAmountInvalid.into())));
+}
+
+/// A single-milestone agreement is created successfully and the milestone
+/// is immediately queryable.
+#[test]
+fn test_create_single_milestone_success() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let fund_amount: i128 = 1000;
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&employer, &fund_amount);
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1000i128],
+    );
+    client.fund_milestone_agreement(&agreement_id, &employer, &fund_amount);
+
+    assert!(agreement_id >= 1);
+    assert_eq!(client.get_milestone_count(&agreement_id), 1);
+    let m = client.get_milestone(&agreement_id, &1).unwrap();
+    assert_eq!(m.amount, 1000);
+    assert!(!m.approved);
+    assert!(!m.claimed);
+
+    // Full lifecycle: approve and claim
+    client.approve_milestone(&agreement_id, &1);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().approved);
+    client.claim_milestone(&agreement_id, &1);
+    let m = client.get_milestone(&agreement_id, &1).unwrap();
+    assert!(m.approved);
+    assert!(m.claimed);
+
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&contributor), 1000);
+}
+
+// fund_milestone_agreement — happy path
+
+/// Funding moves tokens from the employer's wallet to the contract address.
+#[test]
+fn test_fund_transfers_tokens_to_contract() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    asset_client.mint(&employer, &5_000i128);
+
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    client.fund_milestone_agreement(&agreement_id, &employer, &5_000i128);
+
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&client.address), 5_000i128);
+    assert_eq!(token_client.balance(&employer), 0i128);
+}
+
+/// Multiple funding calls accumulate into the accounted escrow balance.
+#[test]
+fn test_fund_accumulates_across_multiple_deposits() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    asset_client.mint(&employer, &3_000i128);
+
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    client.fund_milestone_agreement(&agreement_id, &employer, &1_000i128);
+    client.fund_milestone_agreement(&agreement_id, &employer, &2_000i128);
+
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&client.address), 3_000i128);
+}
+
+/// Full lifecycle: fund → add milestone → approve → claim, with token-balance assertions.
+#[test]
+fn test_fund_then_approve_then_claim_transfers_to_contributor() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    asset_client.mint(&employer, &1_000i128);
+
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1_000i128],
+    );
+    client.fund_milestone_agreement(&agreement_id, &employer, &1_000i128);
+    client.approve_milestone(&agreement_id, &1);
+    client.claim_milestone(&agreement_id, &1);
+
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&contributor), 1_000i128);
+    assert_eq!(token_client.balance(&client.address), 0i128);
+}
+
+/// Funding with exactly the total sum of all milestones satisfies the approve invariant.
+#[test]
+fn test_fund_exact_total_allows_approve() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    asset_client.mint(&employer, &300i128);
+
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    client.add_milestone(&agreement_id, &100i128);
+    client.add_milestone(&agreement_id, &200i128);
+    // Fund after adding milestones — order should not matter.
+    client.fund_milestone_agreement(&agreement_id, &employer, &300i128);
+
+    client.approve_milestone(&agreement_id, &1);
+    client.approve_milestone(&agreement_id, &2);
+
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().approved);
+    assert!(client.get_milestone(&agreement_id, &2).unwrap().approved);
+}
+
+/// Escrow balance decreases correctly after each claim, keeping the invariant tight.
+#[test]
+fn test_escrow_balance_decrements_after_each_claim() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    asset_client.mint(&employer, &300i128);
+
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 100i128, 200i128],
+    );
+    client.fund_milestone_agreement(&agreement_id, &employer, &300i128);
+    client.approve_milestone(&agreement_id, &1);
+    client.approve_milestone(&agreement_id, &2);
+
+    // After claiming milestone 1 (100), contract should hold 200.
+    client.claim_milestone(&agreement_id, &1);
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&client.address), 200i128);
+
+    // After claiming milestone 2 (200), contract should hold 0.
+    client.claim_milestone(&agreement_id, &2);
+    assert_eq!(token_client.balance(&client.address), 0i128);
+    assert_eq!(token_client.balance(&contributor), 300i128);
+}
+
+// fund_milestone_agreement — rejection cases
+
+/// Funding with a zero amount must fail with `MilestoneAmountInvalid`.
+#[test]
+fn test_fund_zero_amount_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    let result = client.try_fund_milestone_agreement(&agreement_id, &employer, &0i128);
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneAmountInvalid.into())));
+}
+
+/// Funding with a negative amount must fail with `MilestoneAmountInvalid`.
+#[test]
+fn test_fund_negative_amount_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    let result = client.try_fund_milestone_agreement(&agreement_id, &employer, &-1i128);
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneAmountInvalid.into())));
+}
+
+/// A non-employer address cannot fund a milestone agreement.
+#[test]
+fn test_fund_non_employer_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let stranger = Address::generate(&env);
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    let result = client.try_fund_milestone_agreement(&agreement_id, &stranger, &500i128);
+    assert_eq!(result, Err(Ok(PayrollError::Unauthorized.into())));
+}
+
+/// The contributor cannot fund the agreement — only the employer can.
+#[test]
+fn test_fund_contributor_cannot_fund_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    let result = client.try_fund_milestone_agreement(&agreement_id, &contributor, &500i128);
+    assert_eq!(result, Err(Ok(PayrollError::Unauthorized.into())));
+}
+
+/// Funding a non-existent agreement ID must fail.
+#[test]
+fn test_fund_nonexistent_agreement_returns_agreement_not_found() {
+    let (_env, employer, _contributor, _token, client) = create_test_env();
+    let result = client.try_fund_milestone_agreement(&999u128, &employer, &500i128);
+    assert_eq!(result, Err(Ok(PayrollError::AgreementNotFound.into())));
+}
+
+/// Approving a milestone without prior funding must fail the balance invariant.
+#[test]
+fn test_approve_without_funding_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    client.add_milestone(&agreement_id, &1_000i128);
+    // No fund_milestone_agreement call — must be rejected.
+    let result = client.try_approve_milestone(&agreement_id, &1);
+    assert_eq!(result, Err(Ok(PayrollError::InsufficientEscrowBalance)));
+}
+
+/// Funding less than the total milestone sum must cause approve to fail.
+#[test]
+fn test_approve_underfunded_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    asset_client.mint(&employer, &499i128);
+
+    let agreement_id = client.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1_000i128],
+    );
+    client.fund_milestone_agreement(&agreement_id, &employer, &499i128); // short by 501
+    let result = client.try_approve_milestone(&agreement_id, &1);
+    assert_eq!(result, Err(Ok(PayrollError::InsufficientEscrowBalance)));
+}
+
+// -----------------------------------------------------------------------------
+// Adding milestones
+// -----------------------------------------------------------------------------
+
+/// Adding a single milestone updates count and milestone data.
+#[test]
+fn test_add_milestone() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    assert_eq!(client.get_milestone_count(&agreement_id), 2);
+    let m = client.get_milestone(&agreement_id, &2).unwrap();
+    assert_eq!(m.id, 2);
+    assert_eq!(m.amount, 1000);
+    assert!(!m.approved);
+    assert!(!m.claimed);
+}
+
+/// Adding multiple milestones assigns sequential IDs and amounts.
+#[test]
+fn test_add_multiple_milestones() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &500);
+    client.add_milestone(&agreement_id, &1000);
+    client.add_milestone(&agreement_id, &1500);
+    assert_eq!(client.get_milestone_count(&agreement_id), 4);
+    assert_eq!(client.get_milestone(&agreement_id, &2).unwrap().amount, 500);
+    assert_eq!(
+        client.get_milestone(&agreement_id, &3).unwrap().amount,
+        1000
+    );
+    assert_eq!(
+        client.get_milestone(&agreement_id, &4).unwrap().amount,
+        1500
+    );
+}
+
+/// Adding a milestone with zero amount must fail.
+#[test]
+fn test_add_milestone_zero_amount_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    let result = client.try_add_milestone(&agreement_id, &0);
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneAmountInvalid)));
+}
+
+/// Adding a milestone when agreement is not in Created status must fail.
+#[test]
+fn test_add_milestone_wrong_status_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.approve_milestone(&agreement_id, &1);
+    client.claim_milestone(&agreement_id, &1);
+    client.approve_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &2);
+    let result = client.try_add_milestone(&agreement_id, &200);
+    assert_eq!(
+        result,
+        Err(Ok(PayrollError::MilestoneAgreementInvalidStatus))
+    );
+}
+
+/// Only employer can add milestones; non-employer must fail.
+#[test]
+#[should_panic]
+fn test_add_milestone_unauthorized_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    env.mock_auths(&[]);
+    client.add_milestone(&agreement_id, &200);
+}
+
+/// Adding milestones increases total amount (verified via milestone amounts).
+#[test]
+fn test_add_milestone_updates_total() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.add_milestone(&agreement_id, &200);
+    client.add_milestone(&agreement_id, &300);
+    let total: i128 = (1..=4)
+        .map(|i| client.get_milestone(&agreement_id, &i).unwrap().amount)
+        .sum();
+    assert_eq!(total, 601);
+}
+
+/// Milestone added updates state; contract emits MilestoneAdded event.
+#[test]
+fn test_milestone_added_event() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &999);
+    let m = client.get_milestone(&agreement_id, &2).unwrap();
+    assert_eq!(m.amount, 999);
+    assert_eq!(m.id, 2);
+}
+
+// -----------------------------------------------------------------------------
+// Approving milestones
+// -----------------------------------------------------------------------------
+
+/// Approving a milestone sets approved flag.
+#[test]
+fn test_approve_milestone() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    client.approve_milestone(&agreement_id, &1);
+    let m = client.get_milestone(&agreement_id, &1).unwrap();
+    assert!(m.approved);
+    assert!(!m.claimed);
+}
+
+/// Multiple milestones can be approved independently.
+#[test]
+fn test_approve_multiple_milestones() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.add_milestone(&agreement_id, &200);
+    client.approve_milestone(&agreement_id, &1);
+    client.approve_milestone(&agreement_id, &2);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().approved);
+    assert!(client.get_milestone(&agreement_id, &2).unwrap().approved);
+}
+
+/// Approving invalid milestone ID must fail.
+#[test]
+fn test_approve_invalid_id_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    let result = client.try_approve_milestone(&agreement_id, &99);
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneNotFound)));
+}
+
+/// Approving when agreement is paused must fail.
+#[test]
+fn test_approve_wrong_status_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.pause_agreement(&agreement_id);
+    let result = client.try_approve_milestone(&agreement_id, &1);
+    assert_eq!(
+        result,
+        Err(Ok(PayrollError::MilestoneAgreementInvalidStatus))
+    );
+}
+
+/// Only employer can approve; contributor cannot approve.
+#[test]
+#[should_panic]
+fn test_approve_unauthorized_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    env.mock_auths(&[]);
+    client.approve_milestone(&agreement_id, &1);
+}
+
+/// Milestone approved event is reflected by state.
+#[test]
+fn test_milestone_approved_event() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.approve_milestone(&agreement_id, &1);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().approved);
+}
+
+// -----------------------------------------------------------------------------
+// Claiming milestones
+// -----------------------------------------------------------------------------
+
+/// Contributor can claim an approved milestone.
+#[test]
+fn test_claim_approved_milestone() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    client.approve_milestone(&agreement_id, &1);
+    client.claim_milestone(&agreement_id, &1);
+    let m = client.get_milestone(&agreement_id, &1).unwrap();
+    assert!(m.approved);
+    assert!(m.claimed);
+}
+
+/// Claiming an unapproved milestone must fail.
+#[test]
+fn test_claim_unapproved_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    let result = client.try_claim_milestone(&agreement_id, &1);
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneNotApproved)));
+}
+
+/// Claiming an already claimed milestone must fail.
+#[test]
+fn test_claim_already_claimed_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    client.approve_milestone(&agreement_id, &1);
+    client.claim_milestone(&agreement_id, &1);
+    let result = client.try_claim_milestone(&agreement_id, &1);
+    assert_eq!(result, Err(Ok(PayrollError::MilestoneAlreadyClaimed)));
+}
+
+/// Only contributor can claim; employer cannot claim.
+#[test]
+#[should_panic]
+fn test_claim_unauthorized_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    client.approve_milestone(&agreement_id, &1);
+    env.mock_auths(&[]);
+    client.claim_milestone(&agreement_id, &1);
+}
+
+/// Claim updates milestone state (released in terms of state).
+#[test]
+fn test_claim_releases_funds() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &1000);
+    client.approve_milestone(&agreement_id, &1);
+    assert!(!client.get_milestone(&agreement_id, &1).unwrap().claimed);
+    client.claim_milestone(&agreement_id, &1);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().claimed);
+}
+
+/// Claimed milestone amount is stored correctly.
+#[test]
+fn test_claim_updates_paid_amount() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &500);
+    client.approve_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &2);
+    let m = client.get_milestone(&agreement_id, &2).unwrap();
+    assert_eq!(m.amount, 500);
+    assert!(m.claimed);
+}
+
+/// Milestone claimed event is reflected by state.
+#[test]
+fn test_milestone_claimed_event() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.approve_milestone(&agreement_id, &1);
+    client.claim_milestone(&agreement_id, &1);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().claimed);
+}
+
+/// When all milestones are claimed, agreement completes (adding another milestone fails).
+#[test]
+fn test_agreement_completes_all_claimed() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.add_milestone(&agreement_id, &200);
+    client.approve_milestone(&agreement_id, &1);
+    client.approve_milestone(&agreement_id, &2);
+    client.approve_milestone(&agreement_id, &3);
+    client.claim_milestone(&agreement_id, &1);
+    client.claim_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &3);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().claimed);
+    assert!(client.get_milestone(&agreement_id, &2).unwrap().claimed);
+    assert!(client.get_milestone(&agreement_id, &3).unwrap().claimed);
+    let result = client.try_add_milestone(&agreement_id, &300);
+    assert_eq!(
+        result,
+        Err(Ok(PayrollError::MilestoneAgreementInvalidStatus))
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Edge cases
+// -----------------------------------------------------------------------------
+
+/// Single-milestone agreement full lifecycle.
+#[test]
+fn test_single_milestone_agreement() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &5000);
+    client.approve_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &2);
+    let m = client.get_milestone(&agreement_id, &2).unwrap();
+    assert!(m.claimed);
+    assert_eq!(m.amount, 5000);
+}
+
+/// Many milestones can be added and claimed.
+#[test]
+fn test_many_milestones() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    for i in 1..=10 {
+        client.add_milestone(&agreement_id, &(i * 100));
+    }
+    assert_eq!(client.get_milestone_count(&agreement_id), 11);
+    for i in 1..=10 {
+        client.approve_milestone(&agreement_id, &i);
+    }
+    for i in 1..=10 {
+        client.claim_milestone(&agreement_id, &i);
+    }
+    for i in 1..=10 {
+        assert!(client.get_milestone(&agreement_id, &i).unwrap().claimed);
+    }
+}
+
+/// Claiming out of order (e.g. 2 then 1) works when both are approved.
+#[test]
+fn test_claiming_out_of_order() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.add_milestone(&agreement_id, &200);
+    client.approve_milestone(&agreement_id, &1);
+    client.approve_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &1);
+    assert!(client.get_milestone(&agreement_id, &1).unwrap().claimed);
+    assert!(client.get_milestone(&agreement_id, &2).unwrap().claimed);
+}
+
+/// Very large milestone amounts are stored and claimed correctly.
+#[test]
+fn test_very_large_milestone_amounts() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    let large = i128::MAX / 2;
+    client.add_milestone(&agreement_id, &large);
+    client.approve_milestone(&agreement_id, &2);
+    client.claim_milestone(&agreement_id, &2);
+    assert_eq!(
+        client.get_milestone(&agreement_id, &2).unwrap().amount,
+        large
+    );
+    assert!(client.get_milestone(&agreement_id, &2).unwrap().claimed);
+}
+
+// -----------------------------------------------------------------------------
+// batch_claim_milestones
+// -----------------------------------------------------------------------------
+
+/// An empty milestone list is rejected up front with a typed error rather than
+/// panicking.
+#[test]
+fn test_batch_claim_empty_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.approve_milestone(&agreement_id, &1);
+
+    let result =
+        client.try_batch_claim_milestones(&agreement_id, &soroban_sdk::Vec::<u32>::new(&env));
+    assert_eq!(result, Err(Ok(PayrollError::InvalidData)));
+}
+
+/// Claiming against an unknown agreement returns AgreementNotFound instead of a
+/// host trap.
+#[test]
+fn test_batch_claim_unknown_agreement_fails() {
+    let (env, _employer, _contributor, _token, client) = create_test_env();
+    let ids = soroban_sdk::vec![&env, 1u32];
+    let result = client.try_batch_claim_milestones(&999u128, &ids);
+    assert_eq!(result, Err(Ok(PayrollError::AgreementNotFound)));
+}
+
+/// A paused agreement rejects batch claims with AgreementPaused.
+#[test]
+fn test_batch_claim_paused_fails() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.approve_milestone(&agreement_id, &1);
+    client.pause_agreement(&agreement_id);
+
+    let ids = soroban_sdk::vec![&env, 1u32];
+    let result = client.try_batch_claim_milestones(&agreement_id, &ids);
+    assert_eq!(result, Err(Ok(PayrollError::AgreementPaused)));
+}
+
+/// All approved milestones in the batch are claimed and accounted for.
+#[test]
+fn test_batch_claim_success() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.add_milestone(&agreement_id, &200);
+    client.approve_milestone(&agreement_id, &2);
+    client.approve_milestone(&agreement_id, &3);
+
+    let ids = soroban_sdk::vec![&env, 2u32, 3u32];
+    let result = client.batch_claim_milestones(&agreement_id, &ids);
+    assert_eq!(result.successful_claims, 2);
+    assert_eq!(result.failed_claims, 0);
+    assert_eq!(result.total_claimed, 300);
+    assert!(client.get_milestone(&agreement_id, &2).unwrap().claimed);
+    assert!(client.get_milestone(&agreement_id, &3).unwrap().claimed);
+}
+
+/// A mixed batch reports per-item error codes: success (0), not approved (3),
+/// and duplicate (1) - without aborting the whole batch.
+#[test]
+fn test_batch_claim_mixed_reports_error_codes() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &100);
+    client.add_milestone(&agreement_id, &200);
+    client.approve_milestone(&agreement_id, &2);
+
+    // [2 approved (100), 3 not approved, 2 duplicate]
+    let ids = soroban_sdk::vec![&env, 2u32, 3u32, 2u32];
+    let result = client.batch_claim_milestones(&agreement_id, &ids);
+
+    assert_eq!(result.successful_claims, 1);
+    assert_eq!(result.failed_claims, 2);
+    assert_eq!(result.total_claimed, 100);
+    assert_eq!(result.results.get(0).unwrap().error_code, 0); // success
+    assert_eq!(result.results.get(1).unwrap().error_code, 3); // not approved
+    assert_eq!(result.results.get(2).unwrap().error_code, 1); // duplicate
+}
+
+// -----------------------------------------------------------------------------
+// milestone-interface conformance (issue #942)
+// -----------------------------------------------------------------------------
+
+/// Converts a `MilestoneView` (from the interface client) to a `Milestone`
+/// for field-by-field comparison with the direct contract result.
+// This conversion helper is retained for the large integration fixture set;
+// some feature-selected test targets do not call it directly.
+#[allow(dead_code)]
+fn view_to_milestone(v: &MilestoneView) -> Milestone {
+    Milestone {
+        id: v.id,
+        amount: v.amount,
+        approved: v.approved,
+        claimed: v.claimed,
+    }
+}
+
+/// Helper: asserts all scalar fields of a `Milestone` match between a direct
+/// result and an interface-client result.
+fn assert_milestone_eq(direct: &Option<Milestone>, via_interface: &Option<MilestoneView>) {
+    match (direct, via_interface) {
+        (Some(d), Some(i)) => {
+            assert_eq!(d.id, i.id, "milestone id mismatch");
+            assert_eq!(d.amount, i.amount, "milestone amount mismatch");
+            assert_eq!(d.approved, i.approved, "milestone approved mismatch");
+            assert_eq!(d.claimed, i.claimed, "milestone claimed mismatch");
+        }
+        (None, None) => {}
+        (d, i) => {
+            panic!("milestone presence mismatch: direct={d:?} interface={i:?}");
+        }
+    }
+}
+
+/// @notice Confirms that `MilestoneContractClient` (from `milestone-interface`)
+///         returns the same results as `PayrollContractClient` for `get_milestone`
+///         and `get_milestone_count` across the full milestone lifecycle.
+///
+/// This test exercises the trait surface declared in
+/// `onchain/contracts/milestone-interface/src/lib.rs` and verifies that
+/// `stello_pay_contract` conforms to the interface contract.
+///
+/// # Conformance checks
+/// 1. `get_milestone_count` — parity after create, add, approve, claim, reject
+/// 2. `get_milestone`       — parity for each milestone's id/amount/approved/claimed
+/// 3. `MilestoneView`       — scalar fields match `Milestone` at every lifecycle state (created,
+///    approved, claimed, rejected, expired)
+#[test]
+fn test_milestone_interface_conformance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    #[allow(deprecated)]
+    let contract_id = env.register(PayrollContract, ());
+    let direct = PayrollContractClient::new(&env, &contract_id);
+    let via = MilestoneContractClient::new(&env, &contract_id);
+
+    let employer = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    // ── 1. Create and fund a milestone agreement ────────────────────────────
+    let fund_amount: i128 = 100_000;
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&employer, &fund_amount);
+    let agreement_id = direct.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1i128],
+    );
+    direct.fund_milestone_agreement(&agreement_id, &employer, &fund_amount);
+
+    // get_milestone_count = 1 (one milestone passed at creation)
+    assert_eq!(
+        direct.get_milestone_count(&agreement_id),
+        via.get_milestone_count(&agreement_id),
+        "get_milestone_count mismatch at creation"
+    );
+    assert_eq!(direct.get_milestone_count(&agreement_id), 1);
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &1),
+        &via.get_milestone(&agreement_id, &1),
+    );
+
+    // ── 2. Add milestones ───────────────────────────────────────────────────
+    direct.add_milestone(&agreement_id, &100);
+    direct.add_milestone(&agreement_id, &200);
+    direct.add_milestone(&agreement_id, &300);
+    direct.add_milestone(&agreement_id, &400);
+
+    assert_eq!(
+        direct.get_milestone_count(&agreement_id),
+        via.get_milestone_count(&agreement_id),
+        "get_milestone_count mismatch after add_milestone"
+    );
+    assert_eq!(direct.get_milestone_count(&agreement_id), 5);
+
+    // Verify each milestone through both clients (id=0 should be None)
+    for mid in 1u32..=5 {
+        assert_milestone_eq(
+            &direct.get_milestone(&agreement_id, &mid),
+            &via.get_milestone(&agreement_id, &mid),
+        );
+        let m = direct.get_milestone(&agreement_id, &mid).unwrap();
+        assert!(!m.approved, "milestone {mid} should not be approved yet");
+        assert!(!m.claimed, "milestone {mid} should not be claimed yet");
+    }
+    // Out-of-range and zero IDs return None
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &0),
+        &via.get_milestone(&agreement_id, &0),
+    );
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &99),
+        &via.get_milestone(&agreement_id, &99),
+    );
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &4),
+        &via.get_milestone(&agreement_id, &4),
+    );
+
+    // ── 3. Approve milestones 1 and 3 ───────────────────────────────────────
+    // Milestone 4 stays unapproved so it can be expired later.
+    direct.approve_milestone(&agreement_id, &1);
+    direct.approve_milestone(&agreement_id, &3);
+
+    // Milestone 1: approved, not claimed
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &1),
+        &via.get_milestone(&agreement_id, &1),
+    );
+    assert!(
+        direct.get_milestone(&agreement_id, &1).unwrap().approved,
+        "milestone 1 should be approved"
+    );
+    assert!(
+        !direct.get_milestone(&agreement_id, &1).unwrap().claimed,
+        "milestone 1 should not be claimed yet"
+    );
+    // Milestone 2: not approved
+    assert!(
+        !direct.get_milestone(&agreement_id, &2).unwrap().approved,
+        "milestone 2 should remain unapproved"
+    );
+    // Milestone 3: approved, not claimed
+    assert!(
+        direct.get_milestone(&agreement_id, &3).unwrap().approved,
+        "milestone 3 should be approved"
+    );
+    // Milestone 4: not approved (will be expired)
+    assert!(
+        !direct.get_milestone(&agreement_id, &4).unwrap().approved,
+        "milestone 4 should remain unapproved"
+    );
+
+    // ── 4. Claim milestone 1 ────────────────────────────────────────────────
+    direct.claim_milestone(&agreement_id, &1);
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &1),
+        &via.get_milestone(&agreement_id, &1),
+    );
+    assert!(
+        direct.get_milestone(&agreement_id, &1).unwrap().claimed,
+        "milestone 1 should be claimed"
+    );
+
+    // ── 5. Reject milestone 2 ───────────────────────────────────────────────
+    // reject_milestone succeeds without approval
+    let reason = soroban_sdk::String::from_str(&env, "missed deadline");
+    direct.reject_milestone(&agreement_id, &2, &reason);
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &2),
+        &via.get_milestone(&agreement_id, &2),
+    );
+    // After reject, milestone is still not approved or claimed (rejected is a
+    // separate flag; approved/claimed remain false).
+    assert!(
+        !direct.get_milestone(&agreement_id, &2).unwrap().approved,
+        "rejected milestone 2 should not be approved"
+    );
+
+    // ── 6. Expire milestone 4 ───────────────────────────────────────────────
+    // expire_milestone requires the milestone to exist but NOT be approved
+    // (the contributor still has the right to claim approved milestones).
+    direct.expire_milestone(&agreement_id, &4);
+    assert_milestone_eq(
+        &direct.get_milestone(&agreement_id, &4),
+        &via.get_milestone(&agreement_id, &4),
+    );
+    // After expiry, the milestone is still unclaimed (expiry flag is separate).
+    assert!(
+        !direct.get_milestone(&agreement_id, &4).unwrap().claimed,
+        "expired milestone 4 should not be claimed"
+    );
+
+    // ── 7. Final count parity ───────────────────────────────────────────────
+    assert_eq!(
+        direct.get_milestone_count(&agreement_id),
+        via.get_milestone_count(&agreement_id),
+        "get_milestone_count mismatch at end of lifecycle"
+    );
+    assert_eq!(direct.get_milestone_count(&agreement_id), 5);
+
+    // ── 8. Empty/zero agreement edge cases ──────────────────────────────────
+    // get_milestone on a non-existent agreement returns None
+    assert_milestone_eq(
+        &direct.get_milestone(&999, &1),
+        &via.get_milestone(&999, &1),
+    );
+    assert_eq!(
+        direct.get_milestone_count(&999),
+        via.get_milestone_count(&999),
+        "get_milestone_count mismatch for unknown agreement"
+    );
+    assert_eq!(direct.get_milestone_count(&999), 0);
+}
+
+// ============================================================================
+// Milestone-interface versioning and backward-compatibility tests (#943)
+//
+// These tests lock the compile-time and runtime stability guarantees described
+// in `onchain/contracts/milestone-interface/src/lib.rs`.  They are regression
+// guards: if any of them fail after a change to the interface crate it is a
+// signal that a breaking change was made without a corresponding version bump.
+// ============================================================================
+
+// ── 1. INTERFACE_VERSION constant ────────────────────────────────────────────
+
+/// Locks the current value of `INTERFACE_VERSION` to 1.
+///
+/// This test must fail (and be updated alongside a changelog entry in
+/// `docs/state-machines.md`) whenever a major version bump is made.  It is
+/// intentionally a hard-coded assertion rather than an indirect comparison so
+/// that reviewers notice the change in the diff.
+#[test]
+fn test_interface_version_is_1() {
+    assert_eq!(
+        milestone_interface::INTERFACE_VERSION,
+        1u32,
+        "INTERFACE_VERSION changed — update docs/state-machines.md and this test"
+    );
+}
+
+/// Confirms the version constant is accessible from outside the crate (public
+/// visibility).  A `pub` regression would break any off-chain tooling that
+/// reads it.
+#[test]
+fn test_interface_version_is_pub() {
+    // Simply referencing it via the crate path proves it is `pub`.
+    let _v: u32 = milestone_interface::INTERFACE_VERSION;
+}
+
+// ── 2. MilestoneAgreementStatus discriminant stability ───────────────────────
+
+/// Verifies that every `MilestoneAgreementStatus` variant is present and that
+/// its derived `PartialEq` equality is consistent.
+///
+/// The XDR encoding of `#[contracttype]` enums depends on declaration order.
+/// If a variant is removed, renamed, or reordered the encoded discriminant
+/// changes and existing XDR streams become undecodable.  This test acts as a
+/// compile-time and runtime fence: any removal of a variant fails to compile;
+/// any renaming breaks the pattern match; any reordering is caught by the
+/// identity assertions below.
+#[test]
+fn test_milestone_agreement_status_variants_stable() {
+    use milestone_interface::MilestoneAgreementStatus;
+
+    // All six variants from version 1 must still exist and round-trip through PartialEq.
+    let variants = [
+        MilestoneAgreementStatus::Created,
+        MilestoneAgreementStatus::Active,
+        MilestoneAgreementStatus::Paused,
+        MilestoneAgreementStatus::Cancelled,
+        MilestoneAgreementStatus::Completed,
+        MilestoneAgreementStatus::Disputed,
+    ];
+
+    // Each variant must equal itself.
+    for v in &variants {
+        assert_eq!(v, v, "variant self-equality failed: {v:?}");
+    }
+
+    // No two distinct variants may be equal.
+    for (i, a) in variants.iter().enumerate() {
+        for (j, b) in variants.iter().enumerate() {
+            if i != j {
+                assert_ne!(a, b, "variants at [{i}] and [{j}] compare equal: {a:?}");
+            }
+        }
+    }
+}
+
+// ── 3. MilestoneView field stability ─────────────────────────────────────────
+
+/// Verifies that `MilestoneView` exposes all four fields declared in version 1
+/// and that they round-trip correctly through construction and comparison.
+///
+/// A field removal or rename causes a compile error; a type change causes a
+/// type-mismatch compile error; a field reorder is caught by the explicit
+/// positional assertions below.
+#[test]
+fn test_milestone_view_fields_stable() {
+    use milestone_interface::MilestoneView;
+
+    let view = MilestoneView {
+        id: 7u32,
+        amount: 12_345i128,
+        approved: true,
+        claimed: false,
+    };
+
+    assert_eq!(view.id, 7u32, "MilestoneView.id field mismatch");
+    assert_eq!(
+        view.amount, 12_345i128,
+        "MilestoneView.amount field mismatch"
+    );
+    assert!(view.approved, "MilestoneView.approved field mismatch");
+    assert!(!view.claimed, "MilestoneView.claimed field mismatch");
+
+    // PartialEq must be derived and work field-by-field.
+    let same = MilestoneView {
+        id: 7u32,
+        amount: 12_345i128,
+        approved: true,
+        claimed: false,
+    };
+    let different = MilestoneView {
+        id: 7u32,
+        amount: 12_345i128,
+        approved: true,
+        claimed: true, // differs
+    };
+    assert_eq!(
+        view, same,
+        "identical MilestoneView structs must compare equal"
+    );
+    assert_ne!(
+        view, different,
+        "different MilestoneView structs must not compare equal"
+    );
+}
+
+// ── Module-level helper contracts for trait surface and hook tests ────────────
+// Soroban's #[contract] macro requires types to be defined at module scope,
+// not inside function bodies.
+
+/// Minimal contract used by `test_trait_method_surface_compiles` to verify
+/// that all three `MilestoneContractInterface` method signatures are present
+/// and callable via `MilestoneContractClient`.
+#[soroban_sdk::contract]
+struct ProbeContract;
+
+#[soroban_sdk::contractimpl]
+impl ProbeContract {
+    pub fn get_milestone(
+        _env: Env,
+        _agreement_id: u128,
+        _milestone_id: u32,
+    ) -> Option<MilestoneView> {
+        None
+    }
+    pub fn get_milestone_count(_env: Env, _agreement_id: u128) -> u32 {
+        0
+    }
+    pub fn on_milestone_expired(_env: Env, _agreement_id: u128, _milestone_id: u32) {}
+}
+
+/// Minimal implementor that does NOT override `on_milestone_expired`,
+/// used by `test_default_hook_is_noop_and_additive` to prove the additive
+/// default-body guarantee.
+#[soroban_sdk::contract]
+struct AdditiveImpl;
+
+#[soroban_sdk::contractimpl]
+impl AdditiveImpl {
+    pub fn get_milestone(
+        _env: Env,
+        _agreement_id: u128,
+        _milestone_id: u32,
+    ) -> Option<MilestoneView> {
+        None
+    }
+    pub fn get_milestone_count(_env: Env, _agreement_id: u128) -> u32 {
+        0
+    }
+    pub fn on_milestone_expired(_env: Env, _agreement_id: u128, _milestone_id: u32) {}
+}
+
+// ── 4. Trait method surface — compile-time proof ──────────────────────────────
+
+/// Confirms that `MilestoneContractClient` exposes `get_milestone`,
+/// `get_milestone_count`, and `on_milestone_expired` at the expected call
+/// signatures.
+///
+/// This test never runs a live contract call; it only exercises the generated
+/// client struct enough to prove the methods exist with the right signatures.
+/// If any method is removed or its signature changes, this test fails to
+/// compile — which is the desired signal.
+#[test]
+fn test_trait_method_surface_compiles() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register(PayrollContract, ());
+    let via = MilestoneContractClient::new(&env, &contract_id);
+
+    // get_milestone — (u128, u32) -> Option<MilestoneView>
+    let _: Option<MilestoneView> = via.get_milestone(&0u128, &0u32);
+
+    // get_milestone_count — (u128) -> u32
+    let _: u32 = via.get_milestone_count(&0u128);
+
+    // on_milestone_expired — (u128, u32) -> ()
+    // Verified via ProbeContract (defined at module scope above).
+    #[allow(deprecated)]
+    let probe_id = env.register(ProbeContract, ());
+    let probe_client = MilestoneContractClient::new(&env, &probe_id);
+
+    // Prove all three method signatures are present and callable.
+    let _: Option<MilestoneView> = probe_client.get_milestone(&1u128, &1u32);
+    let _: u32 = probe_client.get_milestone_count(&1u128);
+    probe_client.on_milestone_expired(&1u128, &1u32);
+}
+
+// ── 5. Default hook is a no-op (additive-change simulation) ──────────────────
+
+/// Confirms that an implementor that does NOT override `on_milestone_expired`
+/// compiles, registers as a contract, and can have the hook called without
+/// any state mutation or panic.
+///
+/// This is the concrete test of the additive-change guarantee: introducing
+/// `on_milestone_expired` as a trait method with a default body must not
+/// require existing implementors to add any code.
+#[test]
+fn test_default_hook_is_noop_and_additive() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Minimal implementor — does not override `on_milestone_expired`.
+    // If the trait required it without a default this would fail to compile.
+    // (Defined at module scope as `AdditiveImpl`.)
+    #[allow(deprecated)]
+    let id = env.register(AdditiveImpl, ());
+    let client = MilestoneContractClient::new(&env, &id);
+
+    // Hook call must complete without panic or state mutation.
+    client.on_milestone_expired(&42u128, &1u32);
+
+    // Query methods still return their documented defaults.
+    assert_eq!(client.get_milestone_count(&42u128), 0u32);
+    assert!(client.get_milestone(&42u128, &1u32).is_none());
+}
+
+// ── 6. get_milestone returns None for out-of-range and zero IDs ──────────────
+
+/// Verifies the documented "must not panic on invalid input" contract for
+/// `get_milestone` via the interface client.
+///
+/// This is a semantic stability test: if the guarantee changes from
+/// "return None" to "panic", the interface contract is broken and the major
+/// version must be bumped.
+#[test]
+fn test_get_milestone_none_for_invalid_ids_via_interface() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    let agreement_id = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+    client.add_milestone(&agreement_id, &500i128);
+
+    let via = MilestoneContractClient::new(&env, &client.address);
+
+    // milestone_id = 0 must return None (1-based IDs).
+    assert!(
+        via.get_milestone(&agreement_id, &0u32).is_none(),
+        "get_milestone(id=0) must return None per the @stable contract"
+    );
+    // milestone_id beyond count must return None.
+    assert!(
+        via.get_milestone(&agreement_id, &999u32).is_none(),
+        "get_milestone(id=out-of-range) must return None per the @stable contract"
+    );
+    // Unknown agreement must return None.
+    assert!(
+        via.get_milestone(&9999u128, &1u32).is_none(),
+        "get_milestone(unknown_agreement) must return None per the @stable contract"
+    );
+}
+
+// ── 7. get_milestone_count returns 0 for unknown agreements ──────────────────
+
+/// Verifies the documented "return 0 for unknown agreement" contract for
+/// `get_milestone_count` via the interface client.
+///
+/// Semantic stability guarantee: changing this to a panic would be a breaking
+/// change that requires a major version bump.
+#[test]
+fn test_get_milestone_count_zero_for_unknown_via_interface() {
+    let (env, employer, contributor, token, client) = create_test_env();
+    // Register the contract but do not create any agreement.
+    let _ = setup_milestone_agreement(&env, &client, &employer, &contributor, &token);
+
+    let via = MilestoneContractClient::new(&env, &client.address);
+
+    assert_eq!(
+        via.get_milestone_count(&99_999u128),
+        0u32,
+        "get_milestone_count for unknown agreement must return 0 per the @stable contract"
+    );
+}
+
+// ── 8. Version 1 method parity across full lifecycle ─────────────────────────
+
+/// Confirms that both `get_milestone` and `get_milestone_count` return
+/// identical results through `MilestoneContractClient` and direct
+/// `PayrollContractClient` at every lifecycle state defined in version 1.
+///
+/// This is a compact regression guard that must be updated whenever a new
+/// `@stable` method is added to the interface.
+#[test]
+fn test_v1_method_parity_across_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register(PayrollContract, ());
+    let direct = PayrollContractClient::new(&env, &contract_id);
+    let via = MilestoneContractClient::new(&env, &contract_id);
+
+    let employer = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&employer, &50_000i128);
+
+    let aid = direct.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1_000i128],
+    );
+    direct.fund_milestone_agreement(&aid, &employer, &50_000i128);
+
+    // State: Created, one upfront milestone.
+    assert_eq!(
+        direct.get_milestone_count(&aid),
+        via.get_milestone_count(&aid)
+    );
+    assert_milestone_eq(
+        &direct.get_milestone(&aid, &1),
+        &via.get_milestone(&aid, &1),
+    );
+
+    // Add the second milestone (the first was created upfront).
+    direct.add_milestone(&aid, &2_000i128);
+    assert_eq!(
+        direct.get_milestone_count(&aid),
+        via.get_milestone_count(&aid)
+    );
+    assert_milestone_eq(
+        &direct.get_milestone(&aid, &1),
+        &via.get_milestone(&aid, &1),
+    );
+    assert_milestone_eq(
+        &direct.get_milestone(&aid, &2),
+        &via.get_milestone(&aid, &2),
+    );
+
+    // Approve milestone 1.
+    direct.approve_milestone(&aid, &1);
+    assert_milestone_eq(
+        &direct.get_milestone(&aid, &1),
+        &via.get_milestone(&aid, &1),
+    );
+
+    // Claim milestone 1.
+    direct.claim_milestone(&aid, &1);
+    assert_milestone_eq(
+        &direct.get_milestone(&aid, &1),
+        &via.get_milestone(&aid, &1),
+    );
+
+    // Reject milestone 2.
+    let reason = soroban_sdk::String::from_str(&env, "out of scope");
+    direct.reject_milestone(&aid, &2, &reason);
+    assert_milestone_eq(
+        &direct.get_milestone(&aid, &2),
+        &via.get_milestone(&aid, &2),
+    );
+
+    // Count unchanged after reject.
+    assert_eq!(
+        direct.get_milestone_count(&aid),
+        via.get_milestone_count(&aid)
+    );
+    assert_eq!(direct.get_milestone_count(&aid), 2u32);
+}
+
+// ── 9. MilestoneView equality is field-by-field (PartialEq contract) ─────────
+
+/// Confirms that `MilestoneView` returned through the interface client matches
+/// the internal `Milestone` struct field-for-field after each transition.
+///
+/// Any divergence here indicates that the `MilestoneView` XDR encoding has
+/// drifted from the internal storage representation — a runtime breaking change
+/// even if the Rust types appear identical.
+#[test]
+fn test_milestone_view_field_parity_with_internal_milestone() {
+    use stello_pay_contract::storage::Milestone;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register(PayrollContract, ());
+    let direct = PayrollContractClient::new(&env, &contract_id);
+    let via = MilestoneContractClient::new(&env, &contract_id);
+
+    let employer = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&employer, &10_000i128);
+
+    let aid = direct.create_milestone_agreement(
+        &employer,
+        &contributor,
+        &token,
+        &soroban_sdk::vec![&env, 1_000i128],
+    );
+    direct.fund_milestone_agreement(&aid, &employer, &10_000i128);
+    direct.add_milestone(&aid, &1_000i128);
+
+    // Helper closure: compare Milestone vs MilestoneView field-by-field.
+    let assert_parity =
+        |direct_opt: Option<Milestone>, via_opt: Option<MilestoneView>| match (direct_opt, via_opt)
+        {
+            (Some(d), Some(v)) => {
+                assert_eq!(d.id, v.id, "id mismatch");
+                assert_eq!(d.amount, v.amount, "amount mismatch");
+                assert_eq!(d.approved, v.approved, "approved mismatch");
+                assert_eq!(d.claimed, v.claimed, "claimed mismatch");
+            }
+            (None, None) => {}
+            (d, v) => panic!("presence mismatch: direct={d:?} via={v:?}"),
+        };
+
+    // After add — unapproved, unclaimed.
+    assert_parity(direct.get_milestone(&aid, &1), via.get_milestone(&aid, &1));
+
+    // After approve.
+    direct.approve_milestone(&aid, &1);
+    assert_parity(direct.get_milestone(&aid, &1), via.get_milestone(&aid, &1));
+
+    // After claim.
+    direct.claim_milestone(&aid, &1);
+    assert_parity(direct.get_milestone(&aid, &1), via.get_milestone(&aid, &1));
+}

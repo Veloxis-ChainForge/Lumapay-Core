@@ -1,0 +1,102 @@
+use soroban_sdk::{Address, Env};
+
+use crate::types::{DisputeDetails, EscalationLevel, StorageKey};
+
+/// Set the time limit (in seconds) for a specific escalation level
+pub fn set_level_time_limit(env: &Env, level: EscalationLevel, limit_seconds: u64) {
+    let key = StorageKey::LevelTimeLimit(level);
+    env.storage().persistent().set(&key, &limit_seconds);
+}
+
+/// Get the time limit (in seconds) for a specific escalation level.
+/// Defaults to 7 days (604800 seconds) if not set.
+pub fn get_level_time_limit(env: &Env, level: EscalationLevel) -> u64 {
+    let key = StorageKey::LevelTimeLimit(level);
+    env.storage().persistent().get(&key).unwrap_or(604800)
+}
+
+/// Set the pending-review time limit (in seconds).
+/// This is the window the admin has to act after `keeper_advance_stage` moves a dispute into
+/// `PendingReview`. Defaults to 3 days (259_200 seconds) if not explicitly set.
+pub fn set_pending_review_time_limit(env: &Env, limit_seconds: u64) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::PendingReviewTimeLimit, &limit_seconds);
+}
+
+/// Get the pending-review time limit (in seconds).
+/// Defaults to 3 days (259_200 s) if not configured.
+pub fn get_pending_review_time_limit(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&StorageKey::PendingReviewTimeLimit)
+        .unwrap_or(259_200)
+}
+
+/// Get details of an active dispute
+pub fn get_dispute(env: &Env, agreement_id: u128) -> Option<DisputeDetails> {
+    let key = StorageKey::Dispute(agreement_id);
+    env.storage().persistent().get(&key)
+}
+
+/// Save dispute details
+pub fn set_dispute(env: &Env, agreement_id: u128, details: &DisputeDetails) {
+    let key = StorageKey::Dispute(agreement_id);
+    env.storage().persistent().set(&key, details);
+}
+
+/// Set the audit logger contract address for compliance recording.
+pub fn set_audit_logger(env: &Env, addr: &Address) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::AuditLogger, addr);
+}
+
+/// Get the configured audit logger contract address, if any.
+pub fn get_audit_logger(env: &Env) -> Option<Address> {
+    env.storage().persistent().get(&StorageKey::AuditLogger)
+}
+
+/// Check if a given address is the contract administrator
+pub fn is_admin(env: &Env, caller: &Address) -> bool {
+    if let Some(admin) = env
+        .storage()
+        .persistent()
+        .get::<_, Address>(&StorageKey::Admin)
+    {
+        return admin == *caller;
+    }
+    // Fall back to owner if no admin is explicitly set
+    if let Some(owner) = env
+        .storage()
+        .persistent()
+        .get::<_, Address>(&StorageKey::Owner)
+    {
+        return owner == *caller;
+    }
+    false
+}
+
+/// Set the configuration for keeper rewards.
+pub fn set_reward_config(env: &Env, token: &Address, pool: &Address, amount: &i128) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::RewardToken, token);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::IncentivePool, pool);
+    env.storage()
+        .persistent()
+        .set(&StorageKey::KeeperRewardAmount, amount);
+}
+
+/// Get the configuration for keeper rewards (token, pool, amount).
+pub fn get_reward_config(env: &Env) -> Option<(Address, Address, i128)> {
+    let token = env.storage().persistent().get(&StorageKey::RewardToken)?;
+    let pool = env.storage().persistent().get(&StorageKey::IncentivePool)?;
+    let amount = env
+        .storage()
+        .persistent()
+        .get(&StorageKey::KeeperRewardAmount)?;
+    Some((token, pool, amount))
+}

@@ -1,0 +1,32 @@
+[package]
+name = "stello_pay_contract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["alloc"] }
+rbac-interface = { path = "../rbac-interface" }
+milestone-interface = { path = "../milestone-interface" }
+
+[dev-dependencies]
+multisig = { path = "../multisig" }
+rbac = { path = "../rbac" }
+rate_limiter = { path = "../rate_limiter" }
+milestone-interface = { path = "../milestone-interface" }
+soroban-sdk = { workspace = true, features = ["alloc", "testutils"] }
+proptest = "1.10.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+price_oracle = { path = "../price_oracle" }
+
+[[bench]]
+name = "performance_benchmarks"
+harness = false
+
+[[bench]]
+name = "critical_paths"
+harness = false

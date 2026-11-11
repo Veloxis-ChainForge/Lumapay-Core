@@ -1,0 +1,1047 @@
+#![no_std]
+#![allow(deprecated)] // env.events().publish() — codebase-wide pattern
+
+use soroban_sdk::{
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol,
+};
+
+// ============================================================================
+// CONTRACT STRUCT
+// ============================================================================
+
+#[contract]
+pub struct SalaryAdjustmentContract;
+
+// ============================================================================
+// DOMAIN TYPES
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdjustmentKind {
+    Increase,
+    Decrease,
+}
+
+/// How a typed salary proposal expresses its delta.
+///
+/// * [`AdjustmentType::Percentage`] — `value` is in basis points (`10_000` = 100%).
+/// * [`AdjustmentType::FixedAmount`] — `value` is an absolute delta in stroops.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdjustmentType {
+    Percentage,
+    FixedAmount,
+}
+
+/// Lifecycle state of a salary adjustment.
+///
+/// Valid transitions are `Pending -> Approved -> Applied` and
+/// `Pending -> Cancelled`. `Rejected` is terminal: a rejected adjustment can
+/// never be approved, applied, cancelled, or re-submitted under the same id.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdjustmentStatus {
+    /// Awaiting a decision from the configured approver.
+    Pending,
+    /// Approved and waiting for the employer to apply it on or after its effective date.
+    Approved,
+    /// Permanently declined by the approver.
+    Rejected,
+    /// Finalized and reflected in the employee's tracked salary.
+    Applied,
+    /// Withdrawn by the employer before an approval decision.
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SalaryAdjustment {
+    pub id: u128,
+    pub employer: Address,
+    pub employee: Address,
+    pub approver: Address,
+    pub kind: AdjustmentKind,
+    pub status: AdjustmentStatus,
+    pub current_salary: i128,
+    pub new_salary: i128,
+    pub effective_date: u64,
+    pub created_at: u64,
+    pub retroactive: bool,
+    pub retroactive_approved_by: Option<Address>,
+    /// Domain-separated reason commitment for a retroactive adjustment.
+    pub reason_hash: Option<BytesN<32>>,
+    /// Human-readable explanation recorded when the adjustment is rejected.
+    /// This is `None` before rejection and immutable once populated.
+    pub rejection_reason: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SalaryAdjustmentAuditEntry {
+    pub id: u128,
+    pub adjustment_id: Option<u128>,
+    pub actor: Address,
+    pub action: Symbol,
+    pub employee: Option<Address>,
+    pub amount: Option<i128>,
+    pub reason_hash: Option<BytesN<32>>,
+    pub timestamp: u64,
+}
+
+// ============================================================================
+// STORAGE KEYS
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone)]
+enum StorageKey {
+    Initialized,
+    Owner,
+    NextAdjustmentId,
+    Adjustment(u128),
+    /// Global salary cap enforced on all new adjustments.
+    SalaryCap,
+    /// Tracks the last applied salary per employee for payroll visibility.
+    EmployeeSalary(Address),
+    /// Monotonic audit id for append-only salary adjustment audit records.
+    NextAuditLogId,
+    /// Append-only audit record keyed by id.
+    AuditLog(u128),
+    /// Prevents conflicting unresolved adjustments for the same employee/effective timestamp.
+    EmployeeEffectiveAdjustment(Address, u64),
+}
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdjustmentCreatedEvent {
+    pub adjustment_id: u128,
+    pub employer: Address,
+    pub employee: Address,
+    pub kind: AdjustmentKind,
+    pub current_salary: i128,
+    pub new_salary: i128,
+    pub effective_date: u64,
+    pub retroactive: bool,
+    pub reason_hash: Option<BytesN<32>>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdjustmentApprovedEvent {
+    pub adjustment_id: u128,
+    pub approver: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdjustmentRejectedEvent {
+    pub adjustment_id: u128,
+    pub approver: Address,
+    /// Human-readable justification persisted on the rejected adjustment.
+    pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdjustmentAppliedEvent {
+    pub adjustment_id: u128,
+    pub employee: Address,
+    pub new_salary: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdjustmentCancelledEvent {
+    pub adjustment_id: u128,
+    pub employer: Address,
+}
+
+/// Emitted when the owner sets or updates the global salary cap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SalaryCapSetEvent {
+    pub owner: Address,
+    pub cap: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdjustmentAuditEvent {
+    pub audit_id: u128,
+    pub adjustment_id: Option<u128>,
+    pub actor: Address,
+    pub action: Symbol,
+    pub employee: Option<Address>,
+    pub amount: Option<i128>,
+    pub reason_hash: Option<BytesN<32>>,
+}
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/// Default maximum allowable salary (1 trillion stroops) used when no
+/// explicit cap has been configured by the owner.
+pub const DEFAULT_MAX_SALARY: i128 = 1_000_000_000_000;
+
+/// Basis-points denominator used by [`AdjustmentType::Percentage`] proposals
+/// (`10_000` bps = 100%).
+pub const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Maximum UTF-8 byte length accepted for a human-readable rejection reason.
+/// The bound limits persistent-storage growth while leaving enough room for an
+/// actionable explanation.
+pub const MAX_REJECTION_REASON_LENGTH: u32 = 256;
+
+const RETRO_REASON_DOMAIN: &[u8] = b"salary_adjustment:retroactive:v1";
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+fn require_initialized(env: &Env) {
+    let initialized = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&StorageKey::Initialized)
+        .unwrap_or(false);
+    assert!(initialized, "Contract not initialized");
+}
+
+fn read_adjustment(env: &Env, adjustment_id: u128) -> SalaryAdjustment {
+    env.storage()
+        .persistent()
+        .get::<_, SalaryAdjustment>(&StorageKey::Adjustment(adjustment_id))
+        .expect("Adjustment not found")
+}
+
+fn write_adjustment(env: &Env, adjustment: &SalaryAdjustment) {
+    env.storage()
+        .persistent()
+        .set(&StorageKey::Adjustment(adjustment.id), adjustment);
+}
+
+fn next_adjustment_id(env: &Env) -> u128 {
+    let current = env
+        .storage()
+        .persistent()
+        .get::<_, u128>(&StorageKey::NextAdjustmentId)
+        .unwrap_or(0);
+    let next = current.checked_add(1).expect("Adjustment id overflow");
+    env.storage()
+        .persistent()
+        .set(&StorageKey::NextAdjustmentId, &next);
+    next
+}
+
+fn next_audit_id(env: &Env) -> u128 {
+    let current = env
+        .storage()
+        .persistent()
+        .get::<_, u128>(&StorageKey::NextAuditLogId)
+        .unwrap_or(0);
+    let next = current.checked_add(1).expect("Audit id overflow");
+    env.storage()
+        .persistent()
+        .set(&StorageKey::NextAuditLogId, &next);
+    next
+}
+
+/// Returns the configured salary cap, falling back to DEFAULT_MAX_SALARY.
+fn effective_salary_cap(env: &Env) -> i128 {
+    env.storage()
+        .persistent()
+        .get::<_, i128>(&StorageKey::SalaryCap)
+        .unwrap_or(DEFAULT_MAX_SALARY)
+}
+
+/// Validates a mandatory, bounded rejection reason before it is persisted.
+///
+/// ASCII whitespace is checked explicitly because Soroban strings expose
+/// UTF-8 bytes rather than Rust `str` values in `no_std` contracts.
+fn assert_valid_rejection_reason(reason: &String) {
+    let bytes = reason.to_bytes();
+    assert!(bytes.len() > 0, "Rejection reason is required");
+    assert!(
+        bytes.len() <= MAX_REJECTION_REASON_LENGTH,
+        "Rejection reason too long"
+    );
+
+    let mut has_content = false;
+    for index in 0..bytes.len() {
+        let byte = bytes.get(index).expect("Rejection reason byte missing");
+        if !(byte == b' ' || byte == b'\t' || byte == b'\n' || byte == b'\r') {
+            has_content = true;
+            break;
+        }
+    }
+    assert!(has_content, "Rejection reason is required");
+}
+
+fn domain_separated_reason_hash(
+    env: &Env,
+    admin: &Address,
+    employer: &Address,
+    employee: &Address,
+    current_salary: i128,
+    new_salary: i128,
+    effective_date: u64,
+    reason_hash: &BytesN<32>,
+) -> BytesN<32> {
+    let mut bytes = Bytes::new(env);
+    for byte in RETRO_REASON_DOMAIN.iter() {
+        bytes.push_back(*byte);
+    }
+    bytes.append(&admin.clone().to_xdr(env));
+    bytes.append(&employer.clone().to_xdr(env));
+    bytes.append(&employee.clone().to_xdr(env));
+    for byte in current_salary.to_le_bytes().iter() {
+        bytes.push_back(*byte);
+    }
+    for byte in new_salary.to_le_bytes().iter() {
+        bytes.push_back(*byte);
+    }
+    for byte in effective_date.to_le_bytes().iter() {
+        bytes.push_back(*byte);
+    }
+    bytes.append(&reason_hash.clone().to_xdr(env));
+    env.crypto().sha256(&bytes).into()
+}
+
+fn assert_adjustment_inputs(
+    env: &Env,
+    current_salary: i128,
+    new_salary: i128,
+    effective_date: u64,
+    allow_retroactive: bool,
+) {
+    assert!(current_salary > 0, "Current salary must be positive");
+    assert!(new_salary > 0, "New salary must be positive");
+    assert!(
+        new_salary != current_salary,
+        "New salary must differ from current salary"
+    );
+
+    let cap = effective_salary_cap(env);
+    assert!(new_salary <= cap, "New salary exceeds salary cap");
+
+    let now = env.ledger().timestamp();
+    if !allow_retroactive {
+        assert!(
+            effective_date >= now,
+            "Effective date cannot be in the past"
+        );
+    }
+}
+
+fn assert_no_conflicting_adjustment(env: &Env, employee: &Address, effective_date: u64) {
+    let existing =
+        env.storage()
+            .persistent()
+            .get::<_, u128>(&StorageKey::EmployeeEffectiveAdjustment(
+                employee.clone(),
+                effective_date,
+            ));
+    assert!(existing.is_none(), "Conflicting adjustment exists");
+}
+
+fn reserve_adjustment_slot(
+    env: &Env,
+    employee: &Address,
+    effective_date: u64,
+    adjustment_id: u128,
+) {
+    env.storage().persistent().set(
+        &StorageKey::EmployeeEffectiveAdjustment(employee.clone(), effective_date),
+        &adjustment_id,
+    );
+}
+
+fn append_audit(
+    env: &Env,
+    actor: Address,
+    action: Symbol,
+    adjustment_id: Option<u128>,
+    employee: Option<Address>,
+    amount: Option<i128>,
+    reason_hash: Option<BytesN<32>>,
+) -> u128 {
+    let audit_id = next_audit_id(env);
+    let entry = SalaryAdjustmentAuditEntry {
+        id: audit_id,
+        adjustment_id,
+        actor: actor.clone(),
+        action: action.clone(),
+        employee: employee.clone(),
+        amount,
+        reason_hash: reason_hash.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+
+    env.storage()
+        .persistent()
+        .set(&StorageKey::AuditLog(audit_id), &entry);
+    env.events().publish(
+        ("salary_adjustment_audit", audit_id),
+        AdjustmentAuditEvent {
+            audit_id,
+            adjustment_id,
+            actor,
+            action,
+            employee,
+            amount,
+            reason_hash,
+        },
+    );
+    audit_id
+}
+
+/// Resolves a typed proposal (`percentage` or `fixed-amount`) into an absolute
+/// `new_salary`, rejecting out-of-range inputs before any storage write.
+///
+/// # Panics
+/// * `"Percentage must be positive"` — percentage `value <= 0`
+/// * `"Fixed amount must be positive"` — fixed-amount `value <= 0`
+/// * `"Adjustment would result in non-positive salary"` — decrease drives salary ≤ 0
+/// * Overflow / underflow on checked arithmetic
+fn compute_proposed_salary(
+    current_salary: i128,
+    adjustment_type: &AdjustmentType,
+    value: i128,
+    kind: &AdjustmentKind,
+) -> i128 {
+    match adjustment_type {
+        AdjustmentType::Percentage => {
+            assert!(value > 0, "Percentage must be positive");
+            let delta = current_salary
+                .checked_mul(value)
+                .expect("Percentage multiplication overflow")
+                .checked_div(BPS_DENOMINATOR)
+                .expect("Percentage division failed");
+            match kind {
+                AdjustmentKind::Increase => current_salary
+                    .checked_add(delta)
+                    .expect("Salary increase overflow"),
+                AdjustmentKind::Decrease => {
+                    let new_salary = current_salary
+                        .checked_sub(delta)
+                        .expect("Salary decrease underflow");
+                    assert!(
+                        new_salary > 0,
+                        "Adjustment would result in non-positive salary"
+                    );
+                    new_salary
+                }
+            }
+        }
+        AdjustmentType::FixedAmount => {
+            assert!(value > 0, "Fixed amount must be positive");
+            match kind {
+                AdjustmentKind::Increase => current_salary
+                    .checked_add(value)
+                    .expect("Salary increase overflow"),
+                AdjustmentKind::Decrease => {
+                    let new_salary = current_salary
+                        .checked_sub(value)
+                        .expect("Salary decrease underflow");
+                    assert!(
+                        new_salary > 0,
+                        "Adjustment would result in non-positive salary"
+                    );
+                    new_salary
+                }
+            }
+        }
+    }
+}
+
+fn create_adjustment_internal(
+    env: &Env,
+    employer: Address,
+    employee: Address,
+    approver: Address,
+    current_salary: i128,
+    new_salary: i128,
+    effective_date: u64,
+    retroactive_approved_by: Option<Address>,
+    reason_hash: Option<BytesN<32>>,
+) -> u128 {
+    let retroactive = effective_date < env.ledger().timestamp();
+    assert_adjustment_inputs(
+        env,
+        current_salary,
+        new_salary,
+        effective_date,
+        retroactive_approved_by.is_some(),
+    );
+    assert_no_conflicting_adjustment(env, &employee, effective_date);
+
+    let kind = if new_salary > current_salary {
+        AdjustmentKind::Increase
+    } else {
+        AdjustmentKind::Decrease
+    };
+
+    let adjustment_id = next_adjustment_id(env);
+
+    let adjustment = SalaryAdjustment {
+        id: adjustment_id,
+        employer: employer.clone(),
+        employee: employee.clone(),
+        approver: approver.clone(),
+        kind: kind.clone(),
+        status: AdjustmentStatus::Pending,
+        current_salary,
+        new_salary,
+        effective_date,
+        created_at: env.ledger().timestamp(),
+        retroactive,
+        retroactive_approved_by,
+        reason_hash: reason_hash.clone(),
+        rejection_reason: None,
+    };
+
+    write_adjustment(env, &adjustment);
+    reserve_adjustment_slot(env, &employee, effective_date, adjustment_id);
+    env.events().publish(
+        ("adjustment_created", adjustment_id),
+        AdjustmentCreatedEvent {
+            adjustment_id,
+            employer: employer.clone(),
+            employee: employee.clone(),
+            kind,
+            current_salary,
+            new_salary,
+            effective_date,
+            retroactive,
+            reason_hash: reason_hash.clone(),
+        },
+    );
+    append_audit(
+        env,
+        employer,
+        Symbol::new(env, "adjustment_created"),
+        Some(adjustment_id),
+        Some(employee),
+        Some(new_salary),
+        reason_hash,
+    );
+
+    adjustment_id
+}
+
+// ============================================================================
+// CONTRACT IMPLEMENTATION
+// ============================================================================
+
+#[contractimpl]
+impl SalaryAdjustmentContract {
+    /// @notice Initializes the salary adjustment contract.
+    /// @dev Can only be executed once. Subsequent calls panic.
+    /// @param owner Address allowed to run owner-level actions (e.g. set_salary_cap).
+    pub fn initialize(env: Env, owner: Address) {
+        owner.require_auth();
+
+        let initialized = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&StorageKey::Initialized)
+            .unwrap_or(false);
+        assert!(!initialized, "Contract already initialized");
+
+        env.storage().persistent().set(&StorageKey::Owner, &owner);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Initialized, &true);
+    }
+
+    /// @notice Sets a global salary cap enforced on all future adjustments.
+    /// @dev Only the contract owner can call this. `cap` must be positive.
+    ///
+    /// # Panics
+    /// * `"Contract not initialized"`
+    /// * `"Only owner can set salary cap"`
+    /// * `"Salary cap must be positive"`
+    ///
+    /// # Events
+    /// Emits `("salary_cap_set", cap)` with a `SalaryCapSetEvent`.
+    pub fn set_salary_cap(env: Env, owner: Address, cap: i128) {
+        require_initialized(&env);
+        owner.require_auth();
+
+        let stored_owner: Address = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Owner)
+            .expect("Owner not set");
+        assert!(owner == stored_owner, "Only owner can set salary cap");
+        assert!(cap > 0, "Salary cap must be positive");
+
+        env.storage().persistent().set(&StorageKey::SalaryCap, &cap);
+
+        env.events().publish(
+            ("salary_cap_set", cap),
+            SalaryCapSetEvent {
+                owner: owner.clone(),
+                cap,
+            },
+        );
+        append_audit(
+            &env,
+            owner,
+            Symbol::new(&env, "salary_cap_set"),
+            None,
+            None,
+            Some(cap),
+            None,
+        );
+    }
+
+    /// @notice Creates a salary adjustment request.
+    /// @dev Determines increase or decrease from salary comparison.
+    ///      Rejects retroactive effective dates (before current ledger time).
+    ///      Rejects new_salary exceeding the configured salary cap.
+    ///      Rejects concurrent proposals for the same employee with the same effective date.
+    ///      Multiple pending proposals for the same employee are allowed if they have
+    ///      different effective dates. Each proposal is identified by its unique id and
+    ///      must be approved/rejected/applied independently.
+    ///
+    /// @param employer Employer submitting the adjustment; must authenticate.
+    /// @param employee Employee whose salary is being adjusted.
+    /// @param approver Address that can approve or reject.
+    /// @param current_salary Current salary amount (must be positive).
+    /// @param new_salary Proposed new salary amount (must differ from current and not exceed cap).
+    /// @param effective_date Timestamp when the adjustment takes effect; must be >= now.
+    /// @return u128 The newly assigned adjustment id.
+    ///
+    /// # Panics
+    /// * `"Contract not initialized"`
+    /// * `"Current salary must be positive"`
+    /// * `"New salary must be positive"`
+    /// * `"New salary must differ from current salary"`
+    /// * `"New salary exceeds salary cap"`
+    /// * `"Effective date cannot be in the past"`
+    /// * `"Conflicting adjustment exists"` (same employee + effective_date)
+    ///
+    /// # Events
+    /// Emits `("adjustment_created", adjustment_id)` with an `AdjustmentCreatedEvent`.
+    pub fn create_adjustment(
+        env: Env,
+        employer: Address,
+        employee: Address,
+        approver: Address,
+        current_salary: i128,
+        new_salary: i128,
+        effective_date: u64,
+    ) -> u128 {
+        require_initialized(&env);
+        employer.require_auth();
+        create_adjustment_internal(
+            &env,
+            employer,
+            employee,
+            approver,
+            current_salary,
+            new_salary,
+            effective_date,
+            None,
+            None,
+        )
+    }
+
+    /// @notice Proposes a salary adjustment using a percentage or fixed-amount delta.
+    /// @dev Computes the absolute `new_salary` from `adjustment_type` + `value` + `kind`,
+    ///      then follows the same pending → approve → apply workflow as `create_adjustment`.
+    ///
+    /// * [`AdjustmentType::Percentage`] — `value` is basis points (`10_000` = 100%). Example:
+    ///   `current=10_000`, `value=1_000` (10%), `kind=Increase` → `new_salary=11_000`.
+    /// * [`AdjustmentType::FixedAmount`] — `value` is an absolute stroop delta. Example:
+    ///   `current=10_000`, `value=2_000`, `kind=Increase` → `new_salary=12_000`.
+    ///
+    /// # Panics
+    /// * `"Percentage must be positive"` — percentage `value <= 0` (rejects negative %)
+    /// * `"Fixed amount must be positive"` — fixed-amount `value <= 0`
+    /// * `"Adjustment would result in non-positive salary"` — decrease drives salary ≤ 0
+    /// * All standard `create_adjustment` validation panics after the absolute salary is computed
+    ///
+    /// # Events
+    /// Emits `("adjustment_created", adjustment_id)` with an `AdjustmentCreatedEvent`.
+    pub fn propose_adjustment(
+        env: Env,
+        employer: Address,
+        employee: Address,
+        approver: Address,
+        current_salary: i128,
+        adjustment_type: AdjustmentType,
+        value: i128,
+        kind: AdjustmentKind,
+        effective_date: u64,
+    ) -> u128 {
+        require_initialized(&env);
+        employer.require_auth();
+
+        let new_salary = compute_proposed_salary(current_salary, &adjustment_type, value, &kind);
+
+        // Kind is caller-declared; enforce it matches the computed direction so a
+        // mismatched (type, kind) pair cannot silently invert the intended change.
+        match kind {
+            AdjustmentKind::Increase => {
+                assert!(
+                    new_salary > current_salary,
+                    "Increase kind requires a higher resulting salary"
+                );
+            }
+            AdjustmentKind::Decrease => {
+                assert!(
+                    new_salary < current_salary,
+                    "Decrease kind requires a lower resulting salary"
+                );
+            }
+        }
+
+        create_adjustment_internal(
+            &env,
+            employer,
+            employee,
+            approver,
+            current_salary,
+            new_salary,
+            effective_date,
+            None,
+            None,
+        )
+    }
+
+    /// @notice Creates a retroactive salary adjustment with explicit owner approval.
+    /// @dev The `effective_date` is a constraint on when the adjustment can be
+    ///      applied (must be past the effective date). The actual salary change
+    ///      takes effect going forward from the time `apply_adjustment` is called.
+    ///      Retroactive adjustments do NOT retroactively alter already-processed
+    ///      payroll periods — past claims are not recalculated or topped up.
+    ///      Requires both the employer and contract owner to authenticate. The
+    ///      provided reason hash is domain-separated with the adjustment details
+    ///      before storage.
+    ///
+    /// # Panics
+    /// * `"Only owner can authorize retroactive adjustment"`
+    /// * `"Retroactive reason hash required"`
+    /// * Standard create validation panics.
+    pub fn create_retroactive_adjustment(
+        env: Env,
+        owner: Address,
+        employer: Address,
+        employee: Address,
+        approver: Address,
+        current_salary: i128,
+        new_salary: i128,
+        effective_date: u64,
+        reason_hash: BytesN<32>,
+    ) -> u128 {
+        require_initialized(&env);
+        owner.require_auth();
+        employer.require_auth();
+
+        let stored_owner: Address = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Owner)
+            .expect("Owner not set");
+        assert!(
+            owner == stored_owner,
+            "Only owner can authorize retroactive adjustment"
+        );
+        assert!(
+            effective_date < env.ledger().timestamp(),
+            "Use create_adjustment for forward adjustments"
+        );
+
+        let zero = BytesN::from_array(&env, &[0; 32]);
+        assert!(reason_hash != zero, "Retroactive reason hash required");
+
+        let stored_reason_hash = domain_separated_reason_hash(
+            &env,
+            &owner,
+            &employer,
+            &employee,
+            current_salary,
+            new_salary,
+            effective_date,
+            &reason_hash,
+        );
+
+        create_adjustment_internal(
+            &env,
+            employer,
+            employee,
+            approver,
+            current_salary,
+            new_salary,
+            effective_date,
+            Some(owner),
+            Some(stored_reason_hash),
+        )
+    }
+
+    /// @notice Approves a pending salary adjustment.
+    /// @dev Only the configured approver can move status from Pending to Approved.
+    /// @param approver Approver address; must authenticate.
+    /// @param adjustment_id Adjustment identifier.
+    ///
+    /// # Panics
+    /// * `"Contract not initialized"`
+    /// * `"Only approver can approve"`
+    /// * `"Adjustment is not pending"`
+    ///
+    /// # Events
+    /// Emits `("adjustment_approved", adjustment_id)` with an `AdjustmentApprovedEvent`.
+    pub fn approve_adjustment(env: Env, approver: Address, adjustment_id: u128) {
+        require_initialized(&env);
+        approver.require_auth();
+
+        let mut adjustment = read_adjustment(&env, adjustment_id);
+        assert!(adjustment.approver == approver, "Only approver can approve");
+        assert!(
+            adjustment.status == AdjustmentStatus::Pending,
+            "Adjustment is not pending"
+        );
+
+        adjustment.status = AdjustmentStatus::Approved;
+        write_adjustment(&env, &adjustment);
+
+        env.events().publish(
+            ("adjustment_approved", adjustment_id),
+            AdjustmentApprovedEvent {
+                adjustment_id,
+                approver: approver.clone(),
+            },
+        );
+        append_audit(
+            &env,
+            approver,
+            Symbol::new(&env, "adjustment_approved"),
+            Some(adjustment_id),
+            Some(adjustment.employee),
+            Some(adjustment.new_salary),
+            adjustment.reason_hash,
+        );
+    }
+
+    /// @notice Rejects a pending salary adjustment and records why it was declined.
+    /// @dev Atomically stores the reason and moves `Pending -> Rejected`. `Rejected`
+    ///      is terminal: the same adjustment id cannot later be approved, applied,
+    ///      cancelled, or re-submitted. The reason is public on-chain data and is
+    ///      limited to [`MAX_REJECTION_REASON_LENGTH`] UTF-8 bytes.
+    /// @param approver Approver address; must authenticate.
+    /// @param adjustment_id Adjustment identifier.
+    /// @param rejection_reason Non-empty human-readable reason for the rejection.
+    ///
+    /// # Panics
+    /// * `"Contract not initialized"`
+    /// * `"Only approver can reject"`
+    /// * `"Adjustment is not pending"`
+    /// * `"Rejection reason is required"`
+    /// * `"Rejection reason too long"`
+    ///
+    /// # Events
+    /// Emits `("adjustment_rejected", adjustment_id)` with an `AdjustmentRejectedEvent`.
+    pub fn reject_adjustment(
+        env: Env,
+        approver: Address,
+        adjustment_id: u128,
+        rejection_reason: String,
+    ) {
+        require_initialized(&env);
+        approver.require_auth();
+
+        let mut adjustment = read_adjustment(&env, adjustment_id);
+        assert!(adjustment.approver == approver, "Only approver can reject");
+        assert!(
+            adjustment.status == AdjustmentStatus::Pending,
+            "Adjustment is not pending"
+        );
+        assert_valid_rejection_reason(&rejection_reason);
+
+        adjustment.status = AdjustmentStatus::Rejected;
+        adjustment.rejection_reason = Some(rejection_reason.clone());
+        write_adjustment(&env, &adjustment);
+
+        env.events().publish(
+            ("adjustment_rejected", adjustment_id),
+            AdjustmentRejectedEvent {
+                adjustment_id,
+                approver: approver.clone(),
+                reason: rejection_reason,
+            },
+        );
+        append_audit(
+            &env,
+            approver,
+            Symbol::new(&env, "adjustment_rejected"),
+            Some(adjustment_id),
+            Some(adjustment.employee),
+            Some(adjustment.new_salary),
+            adjustment.reason_hash,
+        );
+    }
+
+    /// @notice Applies an approved salary adjustment after the effective date.
+    /// @dev Only the employer can apply. Ledger timestamp must be at or past effective_date.
+    ///      Updates the employee's tracked salary for payroll claiming visibility.
+    ///      A `Rejected` adjustment can never satisfy the `Approved` status guard.
+    ///
+    /// @param employer Employer applying the adjustment; must authenticate.
+    /// @param adjustment_id Adjustment identifier.
+    ///
+    /// # Panics
+    /// * `"Contract not initialized"`
+    /// * `"Only employer can apply"`
+    /// * `"Adjustment is not approved"`
+    /// * `"Effective date not reached"`
+    ///
+    /// # Events
+    /// Emits `("adjustment_applied", adjustment_id)` with an `AdjustmentAppliedEvent`.
+    pub fn apply_adjustment(env: Env, employer: Address, adjustment_id: u128) {
+        require_initialized(&env);
+        employer.require_auth();
+
+        let mut adjustment = read_adjustment(&env, adjustment_id);
+        assert!(adjustment.employer == employer, "Only employer can apply");
+        assert!(
+            adjustment.status == AdjustmentStatus::Approved,
+            "Adjustment is not approved"
+        );
+
+        let now = env.ledger().timestamp();
+        assert!(
+            now >= adjustment.effective_date,
+            "Effective date not reached"
+        );
+
+        adjustment.status = AdjustmentStatus::Applied;
+        write_adjustment(&env, &adjustment);
+
+        // Update tracked salary so payroll claiming logic can read the latest effective salary.
+        env.storage().persistent().set(
+            &StorageKey::EmployeeSalary(adjustment.employee.clone()),
+            &adjustment.new_salary,
+        );
+
+        env.events().publish(
+            ("adjustment_applied", adjustment_id),
+            AdjustmentAppliedEvent {
+                adjustment_id,
+                employee: adjustment.employee.clone(),
+                new_salary: adjustment.new_salary,
+            },
+        );
+        append_audit(
+            &env,
+            employer,
+            Symbol::new(&env, "adjustment_applied"),
+            Some(adjustment_id),
+            Some(adjustment.employee),
+            Some(adjustment.new_salary),
+            adjustment.reason_hash,
+        );
+    }
+
+    /// @notice Cancels a pending salary adjustment.
+    /// @dev Only `Pending` adjustments can be cancelled. `Approved`, `Applied`, and
+    ///      terminal `Rejected` adjustments are immutable.
+    /// @param employer Employer requesting cancellation; must authenticate.
+    /// @param adjustment_id Adjustment identifier.
+    ///
+    /// # Panics
+    /// * `"Contract not initialized"`
+    /// * `"Only employer can cancel"`
+    /// * `"Adjustment cannot be cancelled"`
+    ///
+    /// # Events
+    /// Emits `("adjustment_cancelled", adjustment_id)` with an `AdjustmentCancelledEvent`.
+    pub fn cancel_adjustment(env: Env, employer: Address, adjustment_id: u128) {
+        require_initialized(&env);
+        employer.require_auth();
+
+        let mut adjustment = read_adjustment(&env, adjustment_id);
+        assert!(adjustment.employer == employer, "Only employer can cancel");
+        assert!(
+            adjustment.status == AdjustmentStatus::Pending,
+            "Adjustment cannot be cancelled"
+        );
+
+        adjustment.status = AdjustmentStatus::Cancelled;
+        write_adjustment(&env, &adjustment);
+
+        env.events().publish(
+            ("adjustment_cancelled", adjustment_id),
+            AdjustmentCancelledEvent {
+                adjustment_id,
+                employer: employer.clone(),
+            },
+        );
+        append_audit(
+            &env,
+            employer,
+            Symbol::new(&env, "adjustment_cancelled"),
+            Some(adjustment_id),
+            Some(adjustment.employee),
+            Some(adjustment.new_salary),
+            adjustment.reason_hash,
+        );
+    }
+
+    /// @notice Returns a stored salary adjustment by id.
+    /// @param adjustment_id Adjustment identifier.
+    /// @return `Option<SalaryAdjustment>` — `None` if not found.
+    pub fn get_adjustment(env: Env, adjustment_id: u128) -> Option<SalaryAdjustment> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Adjustment(adjustment_id))
+    }
+
+    /// @notice Returns the contract owner address.
+    /// @return `Option<Address>` — `None` before initialization.
+    pub fn get_owner(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&StorageKey::Owner)
+    }
+
+    /// @notice Returns the active salary cap.
+    /// @dev Returns `DEFAULT_MAX_SALARY` if no explicit cap has been set.
+    /// @return i128 The salary cap in stroops.
+    pub fn get_salary_cap(env: Env) -> i128 {
+        effective_salary_cap(&env)
+    }
+
+    /// @notice Returns the last applied salary for an employee.
+    /// @dev Intended for payroll claiming logic to determine the current effective salary.
+    ///      Returns `None` until at least one adjustment has been applied for the employee.
+    ///
+    /// @param employee Employee address to query.
+    /// @return `Option<i128>` — `None` if no adjustment has been applied yet.
+    pub fn get_employee_salary(env: Env, employee: Address) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::EmployeeSalary(employee))
+    }
+
+    /// @notice Returns an append-only audit record by id.
+    /// @param audit_id Audit record identifier.
+    pub fn get_audit_log(env: Env, audit_id: u128) -> Option<SalaryAdjustmentAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::AuditLog(audit_id))
+    }
+
+    /// @notice Returns the number of audit records written so far.
+    pub fn get_audit_log_count(env: Env) -> u128 {
+        env.storage()
+            .persistent()
+            .get::<_, u128>(&StorageKey::NextAuditLogId)
+            .unwrap_or(0)
+    }
+}

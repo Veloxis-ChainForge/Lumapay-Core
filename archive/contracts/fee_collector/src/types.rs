@@ -1,0 +1,116 @@
+//! Core data types for the FeeCollector contract.
+//!
+//! Defines the fee calculation mode and the read-only config snapshot returned
+//! by [`crate::FeeCollectorContract::get_config`].
+
+use soroban_sdk::{contracttype, Address};
+
+// ---------------------------------------------------------------------------
+// Fee mode
+// ---------------------------------------------------------------------------
+
+/// Determines how the protocol fee is calculated on each payment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeeMode {
+    /// Percentage fee expressed in basis points.
+    ///
+    /// `fee = floor(gross_amount × fee_bps / 10 000)`
+    ///
+    /// Floor (truncation) is used because it slightly favours the payer and is
+    /// the de-facto standard for on-chain fee arithmetic.
+    Percentage,
+
+    /// Fixed flat fee in the token's smallest denomination.
+    ///
+    /// The fee is automatically capped at `gross_amount` so `net` never goes below 0.
+    Flat,
+
+    /// Tiered fee schedule based on the gross amount.
+    ///
+    /// Selects a basis point rate from a list of thresholds.
+    Tiered,
+}
+
+// ---------------------------------------------------------------------------
+// Fee tier
+// ---------------------------------------------------------------------------
+
+/// Defines a fee threshold and its associated rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    /// Upper limit of the gross amount for this tier (inclusive).
+    /// Use `i128::MAX` for the catch-all final tier.
+    pub limit: i128,
+    /// Fee rate in basis points for this tier (0 – 1 000).
+    pub fee_bps: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Config snapshot
+// ---------------------------------------------------------------------------
+
+/// Fee routing policy for splitting collected fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeeSplit {
+    /// No split configured: all fees go to the single `FeeRecipient`.
+    ///
+    /// This is used instead of wrapping `FeeSplit` in `Option` because
+    /// Soroban's `#[contracttype]` codegen (under the `testutils` feature)
+    /// cannot derive an `ScVal` conversion for `Option<T>` where `T` is a
+    /// user-defined enum/struct — only primitive-wrapped `Option<T>` is
+    /// supported.
+    None,
+    /// All fees go to a single treasury address (default).
+    Treasury(Address),
+    /// All fees are sent to a burn address (effectively removed from circulation).
+    Burn(Address),
+    /// Fees are split between treasury and burn.
+    /// `treasury_bps` + `burn_bps` must equal `BPS_DENOMINATOR` (10,000).
+    ///
+    /// Tuple fields, in order: `(treasury, burn, treasury_bps, burn_bps)`.
+    /// Named fields are not used here because Soroban's `#[contracttype]` does
+    /// not support struct-like (named-field) enum variants.
+    Split(Address, Address, u32, u32),
+}
+
+/// Snapshot of a fee quote computed for a specific gross amount.
+///
+/// `calculate_fee` writes the latest quote for a gross amount for later reuse by
+/// `collect_fee`. This makes a previously shown quote settle consistently even if
+/// the active config changes before collection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeQuote {
+    /// Gross amount that was used to compute the fee.
+    pub gross_amount: i128,
+    /// Fee amount computed at the time of the quote.
+    pub fee_amount: i128,
+    /// Net amount that would be transferred at the time of the quote.
+    pub net_amount: i128,
+}
+
+/// Read-only snapshot of the current fee configuration.
+///
+/// Returned by [`crate::FeeCollectorContract::get_config`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    /// Treasury address that receives collected fees.
+    pub recipient: Address,
+    /// Percentage fee in basis points. Only active when `mode = Percentage`.
+    pub fee_bps: u32,
+    /// Flat fee amount in token units. Only active when `mode = Flat`.
+    pub flat_fee: i128,
+    /// Currently active fee mode.
+    pub mode: FeeMode,
+    /// Currently active tiered schedule. Only active when `mode = Tiered`.
+    pub tiered_schedule: soroban_sdk::Vec<FeeTier>,
+    /// Whether fee collection is currently paused.
+    pub paused: bool,
+    /// Fee routing split policy. `FeeSplit::None` means no split is configured
+    /// (all fees go to the single `recipient`).
+    pub split: FeeSplit,
+}

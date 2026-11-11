@@ -1,0 +1,1386 @@
+//! Comprehensive tests for the FeeCollector contract.
+//!
+//! Coverage targets:
+//! * Initialization (happy path, double-init guard, invalid params)
+//! * `collect_fee` — percentage mode (exact, floor rounding, zero-bps, max-bps)
+//! * `collect_fee` — flat mode (normal, zero flat fee, flat fee ≥ gross)
+//! * `calculate_fee` — pure computation, zero gross
+//! * Config update & mode switching
+//! * Recipient update
+//! * Pause / unpause
+//! * Admin transfer
+//! * Cumulative `TotalFeesCollected` accumulation
+//! * View helpers (`get_config`, `get_admin`)
+//! * All unauthorised-access paths
+//! * Edge cases: 1-token payment, large amounts (overflow safety)
+
+use fee_collector::{FeeCollectorContract, FeeCollectorContractClient, FeeMode};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
+
+// ─── Fixtures ────────────────────────────────────────────────────────────────
+
+/// Creates a Stellar test token and returns its client.
+fn create_token<'a>(env: &Env, admin: &Address) -> token::Client<'a> {
+    let addr = env.register_stellar_asset_contract(admin.clone());
+    token::Client::new(env, &addr)
+}
+
+/// Deploys the FeeCollector contract and returns its client.
+fn create_contract<'a>(env: &Env) -> FeeCollectorContractClient<'a> {
+    let id = env.register_contract(None, FeeCollectorContract);
+    FeeCollectorContractClient::new(env, &id)
+}
+
+/// Convenience: deploy + initialize with percentage mode and given `fee_bps`.
+fn setup_percentage<'a>(
+    env: &'a Env,
+    admin: &Address,
+    treasury: &Address,
+    fee_bps: u32,
+) -> FeeCollectorContractClient<'a> {
+    let client = create_contract(env);
+    client.initialize(admin, treasury, &fee_bps, &0i128, &FeeMode::Percentage);
+    client
+}
+
+/// Convenience: deploy + initialize with flat mode and given `flat_fee`.
+fn setup_flat<'a>(
+    env: &'a Env,
+    admin: &Address,
+    treasury: &Address,
+    flat_fee: i128,
+) -> FeeCollectorContractClient<'a> {
+    let client = create_contract(env);
+    client.initialize(admin, treasury, &0u32, &flat_fee, &FeeMode::Flat);
+    client
+}
+
+// ─── Initialization tests ─────────────────────────────────────────────────────
+
+#[test]
+fn test_initialize_percentage_mode() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let cfg = client.get_config();
+    assert_eq!(cfg.fee_bps, 100);
+    assert_eq!(cfg.flat_fee, 0);
+    assert_eq!(cfg.mode, FeeMode::Percentage);
+    assert_eq!(cfg.recipient, treasury);
+    assert!(!cfg.paused);
+}
+
+#[test]
+fn test_initialize_flat_mode() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_flat(&env, &admin, &treasury, 50);
+
+    let cfg = client.get_config();
+    assert_eq!(cfg.flat_fee, 50);
+    assert_eq!(cfg.mode, FeeMode::Flat);
+}
+
+#[test]
+fn test_initialize_zero_fee_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    // 0 bps should be accepted (fee-free operation)
+    let client = setup_percentage(&env, &admin, &treasury, 0);
+    assert_eq!(client.get_config().fee_bps, 0);
+}
+
+#[test]
+fn test_get_admin_returns_correct_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 50);
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_total_fees_collected_starts_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    assert_eq!(client.get_total_fees_collected(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Contract already initialized")]
+fn test_double_initialization_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    // Second init must panic.
+    client.initialize(&admin, &treasury, &100u32, &0i128, &FeeMode::Percentage);
+}
+
+#[test]
+#[should_panic(expected = "Fee exceeds maximum allowed (1000 bps)")]
+fn test_fee_bps_above_max_panics_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = create_contract(&env);
+    // 1001 bps > MAX_FEE_BPS (1000)
+    client.initialize(&admin, &treasury, &1001u32, &0i128, &FeeMode::Percentage);
+}
+
+#[test]
+#[should_panic(expected = "Flat fee must be non-negative")]
+fn test_negative_flat_fee_panics_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = create_contract(&env);
+    client.initialize(&admin, &treasury, &0u32, &-1i128, &FeeMode::Flat);
+}
+
+// ─── collect_fee — Percentage mode ───────────────────────────────────────────
+
+#[test]
+fn test_collect_fee_percentage_1_pct_exact() {
+    // 1 % of 1 000 tokens = 10 fee, 990 net
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100); // 100 bps = 1 %
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+
+    assert_eq!(fee, 10);
+    assert_eq!(net, 990);
+    assert_eq!(tok.balance(&treasury), 10);
+    assert_eq!(tok.balance(&recipient), 990);
+    assert_eq!(tok.balance(&payer), 0);
+}
+
+#[test]
+fn test_collect_fee_percentage_floor_rounding() {
+    // 1 % of 999 tokens = floor(9.99) = 9 fee, 990 net
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &999);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &999);
+
+    // floor(999 * 100 / 10000) = floor(9.99) = 9
+    assert_eq!(fee, 9);
+    assert_eq!(net, 990);
+    assert_eq!(tok.balance(&treasury), 9);
+    assert_eq!(tok.balance(&recipient), 990);
+}
+
+#[test]
+fn test_collect_fee_percentage_small_amount_floor_to_zero() {
+    // 1 % of 9 tokens = floor(0.09) = 0 fee (all goes to recipient)
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &9);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &9);
+
+    assert_eq!(fee, 0);
+    assert_eq!(net, 9);
+    assert_eq!(tok.balance(&treasury), 0);
+    assert_eq!(tok.balance(&recipient), 9);
+}
+
+#[test]
+fn test_collect_fee_percentage_zero_bps_no_fee() {
+    // 0 bps → entire gross goes to recipient, treasury receives nothing
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &500);
+
+    let client = setup_percentage(&env, &admin, &treasury, 0);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &500);
+
+    assert_eq!(fee, 0);
+    assert_eq!(net, 500);
+    assert_eq!(tok.balance(&treasury), 0);
+    assert_eq!(tok.balance(&recipient), 500);
+}
+
+#[test]
+fn test_collect_fee_percentage_max_bps_10_pct() {
+    // 1000 bps = 10 % of 1 000 tokens = 100 fee, 900 net
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 1_000); // MAX_FEE_BPS
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+
+    assert_eq!(fee, 100);
+    assert_eq!(net, 900);
+    assert_eq!(tok.balance(&treasury), 100);
+    assert_eq!(tok.balance(&recipient), 900);
+}
+
+#[test]
+fn test_collect_fee_percentage_one_token_payment() {
+    // 100 bps on 1 token = floor(0.01) = 0 fee
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &1);
+
+    assert_eq!(fee, 0);
+    assert_eq!(net, 1);
+}
+
+#[test]
+fn test_collect_fee_percentage_large_amount() {
+    // 50 bps on 10_000_000_000 (10 billion) tokens
+    // fee = 10_000_000_000 * 50 / 10_000 = 50_000_000
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    let large: i128 = 10_000_000_000;
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &large);
+
+    let client = setup_percentage(&env, &admin, &treasury, 50); // 0.5 %
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &large);
+
+    assert_eq!(fee, 50_000_000);
+    assert_eq!(net, large - 50_000_000);
+    assert_eq!(tok.balance(&treasury), 50_000_000);
+}
+
+// ─── collect_fee — Flat mode ──────────────────────────────────────────────────
+
+#[test]
+fn test_collect_fee_flat_normal() {
+    // flat fee 50 on 1 000 tokens → 50 fee, 950 net
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_flat(&env, &admin, &treasury, 50);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+
+    assert_eq!(fee, 50);
+    assert_eq!(net, 950);
+    assert_eq!(tok.balance(&treasury), 50);
+    assert_eq!(tok.balance(&recipient), 950);
+}
+
+#[test]
+fn test_collect_fee_flat_zero() {
+    // flat fee 0 → no fee, all to recipient
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &200);
+
+    let client = setup_flat(&env, &admin, &treasury, 0);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &200);
+
+    assert_eq!(fee, 0);
+    assert_eq!(net, 200);
+    assert_eq!(tok.balance(&treasury), 0);
+    assert_eq!(tok.balance(&recipient), 200);
+}
+
+#[test]
+fn test_collect_fee_flat_equal_to_gross() {
+    // flat fee == gross → fee capped at gross, net = 0
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &100);
+
+    // flat_fee = 100, gross = 100 → fee = min(100, 100) = 100, net = 0
+    let client = setup_flat(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &100);
+
+    assert_eq!(fee, 100);
+    assert_eq!(net, 0);
+    assert_eq!(tok.balance(&treasury), 100);
+    assert_eq!(tok.balance(&recipient), 0);
+}
+
+#[test]
+fn test_collect_fee_flat_exceeds_gross_capped() {
+    // flat fee (200) > gross (100) → capped to 100, net = 0
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &100);
+
+    let client = setup_flat(&env, &admin, &treasury, 200);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &100);
+
+    assert_eq!(fee, 100); // capped
+    assert_eq!(net, 0);
+    assert_eq!(tok.balance(&treasury), 100);
+}
+
+// ─── calculate_fee ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_calculate_fee_percentage_no_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 200); // 2 %
+
+    let (net, fee) = client.calculate_fee(&1_000);
+    assert_eq!(fee, 20);
+    assert_eq!(net, 980);
+    // No token state should change — no token was involved.
+}
+
+#[test]
+fn test_calculate_fee_flat_no_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_flat(&env, &admin, &treasury, 75);
+
+    let (net, fee) = client.calculate_fee(&500);
+    assert_eq!(fee, 75);
+    assert_eq!(net, 425);
+}
+
+#[test]
+fn test_calculate_fee_zero_gross_returns_zeros() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.calculate_fee(&0);
+    assert_eq!(fee, 0);
+    assert_eq!(net, 0);
+}
+
+#[test]
+fn test_calculate_fee_rounding_identical_to_collect() {
+    // Verify calculate_fee and collect_fee agree on the same amount.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &777);
+
+    let client = setup_percentage(&env, &admin, &treasury, 150); // 1.5 %
+
+    let (calc_net, calc_fee) = client.calculate_fee(&777);
+    let (actual_net, actual_fee) = client.collect_fee(&payer, &recipient, &tok.address, &777);
+
+    assert_eq!(calc_fee, actual_fee);
+    assert_eq!(calc_net, actual_net);
+}
+
+// ─── Admin config update ──────────────────────────────────────────────────────
+
+#[test]
+fn test_update_fee_config_changes_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.update_fee_config(&admin, &500u32, &0i128, &FeeMode::Percentage);
+
+    let cfg = client.get_config();
+    assert_eq!(cfg.fee_bps, 500);
+    assert_eq!(cfg.mode, FeeMode::Percentage);
+}
+
+#[test]
+fn test_collect_fee_uses_prior_calculate_fee_quote_after_config_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (quoted_net, quoted_fee) = client.calculate_fee(&1_000);
+    assert_eq!(quoted_fee, 10);
+    assert_eq!(quoted_net, 990);
+
+    client.update_fee_config(&admin, &500u32, &0i128, &FeeMode::Percentage);
+
+    let (settled_net, settled_fee) = client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+    assert_eq!(settled_fee, quoted_fee);
+    assert_eq!(settled_net, quoted_net);
+    assert_eq!(tok.balance(&treasury), quoted_fee);
+    assert_eq!(tok.balance(&recipient), quoted_net);
+}
+
+#[test]
+fn test_calculate_fee_after_config_change_uses_new_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (initial_net, initial_fee) = client.calculate_fee(&1_000);
+    assert_eq!(initial_fee, 10);
+    assert_eq!(initial_net, 990);
+
+    client.update_fee_config(&admin, &500u32, &0i128, &FeeMode::Percentage);
+
+    let (updated_net, updated_fee) = client.calculate_fee(&1_000);
+    assert_eq!(updated_fee, 50);
+    assert_eq!(updated_net, 950);
+}
+
+#[test]
+fn test_update_fee_config_switches_to_flat_mode() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.update_fee_config(&admin, &0u32, &25i128, &FeeMode::Flat);
+
+    let cfg = client.get_config();
+    assert_eq!(cfg.mode, FeeMode::Flat);
+    assert_eq!(cfg.flat_fee, 25);
+}
+
+#[test]
+fn test_update_fee_config_to_zero_disables_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 300);
+
+    // Disable fee
+    client.update_fee_config(&admin, &0u32, &0i128, &FeeMode::Percentage);
+
+    let (net, fee) = client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+    assert_eq!(fee, 0);
+    assert_eq!(net, 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Fee exceeds maximum allowed (1000 bps)")]
+fn test_update_fee_config_above_max_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.update_fee_config(&admin, &1001u32, &0i128, &FeeMode::Percentage);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_update_fee_config_unauthorized_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.update_fee_config(&attacker, &50u32, &0i128, &FeeMode::Percentage);
+}
+
+// ─── Recipient update ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_recipient_routes_fees_to_new_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_percentage(&env, &admin, &old_treasury, 100);
+
+    client.update_recipient(&admin, &new_treasury);
+
+    let (_, fee) = client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+
+    // Fee must land in the new treasury, not the old one.
+    assert_eq!(tok.balance(&new_treasury), fee);
+    assert_eq!(tok.balance(&old_treasury), 0);
+}
+
+#[test]
+fn test_update_recipient_get_config_reflects_change() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &old_treasury, 100);
+
+    client.update_recipient(&admin, &new_treasury);
+    assert_eq!(client.get_config().recipient, new_treasury);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_update_recipient_unauthorized_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.update_recipient(&attacker, &new_treasury);
+}
+
+// ─── Pause / unpause ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_set_paused_config_reflects_paused_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.set_paused(&admin, &true);
+    assert!(client.get_config().paused);
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused")]
+fn test_collect_fee_blocked_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &500);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    client.set_paused(&admin, &true);
+    client.collect_fee(&payer, &recipient, &tok.address, &500);
+}
+
+#[test]
+fn test_unpause_re_enables_collect_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &500);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    client.set_paused(&admin, &true);
+    client.set_paused(&admin, &false);
+
+    assert!(!client.get_config().paused);
+
+    // Must succeed after unpausing.
+    let (_, fee) = client.collect_fee(&payer, &recipient, &tok.address, &500);
+    assert_eq!(fee, 5);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_set_paused_unauthorized_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.set_paused(&attacker, &true);
+}
+
+#[test]
+fn test_calculate_fee_still_works_while_paused() {
+    // Pause blocks only collect_fee — calculate_fee (read-only) must
+    // continue to function so integrators can preview fees during an
+    // incident response window.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.set_paused(&admin, &true);
+    assert!(client.get_config().paused);
+
+    let (net, fee) = client.calculate_fee(&1_000);
+    assert_eq!(fee, 10);
+    assert_eq!(net, 990);
+}
+
+#[test]
+fn test_paused_collect_fee_preserves_balances_and_counter() {
+    // When collect_fee panics due to pause, no tokens should move
+    // and the TotalFeesCollected counter must remain unchanged.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &500);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    // Capture pre-pause state.
+    let payer_balance_before = tok.balance(&payer);
+    let treasury_balance_before = tok.balance(&treasury);
+    let total_before = client.get_total_fees_collected();
+
+    client.set_paused(&admin, &true);
+
+    // collect_fee must panic while paused.
+    let result = client.try_collect_fee(&payer, &recipient, &tok.address, &500);
+    assert!(result.is_err());
+
+    // Balances and counter must be unchanged.
+    assert_eq!(tok.balance(&payer), payer_balance_before);
+    assert_eq!(tok.balance(&treasury), treasury_balance_before);
+    assert_eq!(client.get_total_fees_collected(), total_before);
+}
+
+// ─── Two-step admin transfer ──────────────────────────────────────────────────
+
+#[test]
+fn test_propose_admin_stores_pending_admin() {
+    // After propose_admin, the pending admin is recorded but has no effect yet.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // Pending admin is visible via get_pending_admin.
+    assert_eq!(client.get_pending_admin(), Some(new_admin));
+    // Current admin is unchanged.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_proposed_admin_has_no_effect_until_accepted() {
+    // The proposed address cannot perform admin actions before calling accept_admin.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // Current admin is still the original address.
+    assert_eq!(client.get_admin(), admin);
+
+    // new_admin is NOT yet the admin; update_fee_config called with new_admin
+    // but require_admin checks the stored Admin key which is still `admin`,
+    // so this must panic.
+    //
+    // We do this in a separate should_panic sub-test below.
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_proposed_admin_cannot_act_before_acceptance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // new_admin not yet accepted → must be rejected as not-admin.
+    client.update_fee_config(&new_admin, &200u32, &0i128, &FeeMode::Percentage);
+}
+
+#[test]
+fn test_accept_admin_completes_handoff() {
+    // After accept_admin, the proposed address becomes the active admin.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+    client.accept_admin(&new_admin);
+
+    // Admin slot now holds new_admin.
+    assert_eq!(client.get_admin(), new_admin);
+    // Pending slot cleared.
+    assert_eq!(client.get_pending_admin(), None);
+}
+
+#[test]
+fn test_new_admin_can_act_after_acceptance() {
+    // Verify the new admin can perform privileged actions post-acceptance.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+    client.accept_admin(&new_admin);
+
+    client.update_fee_config(&new_admin, &300u32, &0i128, &FeeMode::Percentage);
+    assert_eq!(client.get_config().fee_bps, 300);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_old_admin_cannot_act_after_acceptance() {
+    // The original admin loses all privileges once the new admin has accepted.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+    client.accept_admin(&new_admin);
+
+    // Old admin is now rejected.
+    client.update_fee_config(&admin, &50u32, &0i128, &FeeMode::Percentage);
+}
+
+#[test]
+#[should_panic(expected = "Caller is not the proposed admin")]
+fn test_only_proposed_address_can_accept() {
+    // A third party (attacker) cannot accept a proposal intended for someone else.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // Attacker tries to hijack the acceptance — must panic.
+    client.accept_admin(&attacker);
+}
+
+#[test]
+#[should_panic(expected = "No pending admin transfer")]
+fn test_accept_admin_without_proposal_panics() {
+    // accept_admin with no outstanding proposal must panic.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.accept_admin(&admin);
+}
+
+#[test]
+fn test_cancel_admin_transfer_clears_pending() {
+    // cancel_admin_transfer removes the pending proposal; the admin stays unchanged.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    client.cancel_admin_transfer(&admin);
+
+    // Pending admin is gone.
+    assert_eq!(client.get_pending_admin(), None);
+    // Admin is still the original.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+#[should_panic(expected = "No pending admin transfer")]
+fn test_cancel_without_pending_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    // No proposal exists — must panic.
+    client.cancel_admin_transfer(&admin);
+}
+
+#[test]
+#[should_panic(expected = "No pending admin transfer")]
+fn test_cancelled_proposal_cannot_be_accepted() {
+    // After cancellation the previously-proposed address must no longer be able to accept.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+    client.cancel_admin_transfer(&admin);
+
+    // Pending is cleared → accept_admin panics with "No pending admin transfer".
+    client.accept_admin(&new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_propose_admin_unauthorized_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&attacker, &new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized: caller is not admin")]
+fn test_cancel_admin_transfer_unauthorized_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &new_admin);
+    client.cancel_admin_transfer(&attacker);
+}
+
+#[test]
+fn test_get_pending_admin_returns_none_when_no_proposal() {
+    // Before any proposal, get_pending_admin returns None.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    assert_eq!(client.get_pending_admin(), None);
+}
+
+#[test]
+fn test_propose_admin_overwrites_previous_proposal() {
+    // A second propose_admin replaces the first, so only the latest address can accept.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let first_candidate = Address::generate(&env);
+    let second_candidate = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.propose_admin(&admin, &first_candidate);
+    client.propose_admin(&admin, &second_candidate);
+
+    // Only second_candidate is pending now.
+    assert_eq!(client.get_pending_admin(), Some(second_candidate.clone()));
+
+    // second_candidate accepts successfully.
+    client.accept_admin(&second_candidate);
+    assert_eq!(client.get_admin(), second_candidate);
+}
+
+// ─── Cumulative total fees ─────────────────────────────────────────────────────
+
+#[test]
+fn test_total_fees_accumulates_across_multiple_payments() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &3_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100); // 1 %
+
+    // Three payments of 1 000 each → 10 fee each → 30 total
+    client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+    client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+    client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+
+    assert_eq!(client.get_total_fees_collected(), 30);
+    assert_eq!(tok.balance(&treasury), 30);
+}
+
+#[test]
+fn test_total_fees_not_updated_when_zero_fee() {
+    // When fee is 0 bps, TotalFeesCollected must remain 0.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &1_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 0);
+    client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+
+    assert_eq!(client.get_total_fees_collected(), 0);
+}
+
+#[test]
+fn test_total_fees_after_config_change() {
+    // Change fee mid-stream; accumulator reflects actual fees collected.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &2_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100); // 1 %
+
+    // First payment at 1 % → 10 fee
+    client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+    assert_eq!(client.get_total_fees_collected(), 10);
+
+    // Change to 5 % (500 bps)
+    client.update_fee_config(&admin, &500u32, &0i128, &FeeMode::Percentage);
+
+    // Second payment at 5 % → 50 fee
+    client.collect_fee(&payer, &recipient, &tok.address, &1_000);
+    assert_eq!(client.get_total_fees_collected(), 60);
+}
+
+// ─── Collect fee error cases ───────────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Gross amount must be positive")]
+fn test_collect_fee_zero_gross_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    client.collect_fee(&payer, &recipient, &tok.address, &0);
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused")]
+fn test_collect_fee_while_paused_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&payer, &500);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    client.set_paused(&admin, &true);
+    client.collect_fee(&payer, &recipient, &tok.address, &500);
+}
+
+// ─── calculate_fee zero-amount edge cases (issue #767) ────────────────────
+
+#[test]
+fn test_calculate_fee_zero_gross_returns_zero() {
+    // Issue #767: verify that calculate_fee(0) returns (0, 0)
+    // without panicking and that the result is a valid FeeQuote.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.calculate_fee(&0i128);
+    assert_eq!(net, 0);
+    assert_eq!(fee, 0);
+}
+
+#[test]
+fn test_calculate_fee_small_amount_percentage_rounds_to_zero() {
+    // Issue #767: when the gross amount is so small that the
+    // percentage-based fee rounds down to 0, verify calculate_fee
+    // returns fee=0 and net=gross rather than silently assuming
+    // a non-zero fee.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // 1 bps = 0.01%. 1 token * 0.01% = 0.0001 -> floor = 0.
+    let client = setup_percentage(&env, &admin, &treasury, 1);
+    let (net, fee) = client.calculate_fee(&1i128);
+    assert_eq!(fee, 0, "1 bps on 1 token must round to 0 fee");
+    assert_eq!(net, 1);
+}
+
+#[test]
+fn test_calculate_fee_exactly_one_percent_threshold() {
+    // Issue #767: verify the edge where gross is just below and
+    // exactly at the threshold where a non-zero fee first appears.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // At 100 bps (1%), 99 tokens rounds down to 0; 100 -> fee = 1.
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+    let (net_99, fee_99) = client.calculate_fee(&99i128);
+    assert_eq!(fee_99, 0, "1% of 99 rounds down to 0");
+    assert_eq!(net_99, 99);
+
+    let (net_100, fee_100) = client.calculate_fee(&100i128);
+    assert_eq!(fee_100, 1, "1% of 100 yields exactly 1");
+    assert_eq!(net_100, 99);
+}
+
+// ─── calculate_fee error cases ────────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Gross amount must be non-negative")]
+fn test_calculate_fee_negative_gross_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    client.calculate_fee(&-1);
+}
+
+// ─── get_config completeness ──────────────────────────────────────────────────
+
+#[test]
+fn test_get_config_all_fields_after_updates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    let client = setup_percentage(&env, &admin, &treasury, 200);
+
+    client.update_fee_config(&admin, &300u32, &15i128, &FeeMode::Flat);
+    client.update_recipient(&admin, &new_treasury);
+    client.set_paused(&admin, &true);
+
+    let cfg = client.get_config();
+    assert_eq!(cfg.fee_bps, 300);
+    assert_eq!(cfg.flat_fee, 15);
+    assert_eq!(cfg.mode, FeeMode::Flat);
+    assert_eq!(cfg.recipient, new_treasury);
+    assert!(cfg.paused);
+}
+
+// ─── Identical payer and recipient edge case ─────────────────────────────────
+
+#[test]
+fn test_payer_is_payment_recipient_still_pays_fee() {
+    // If payer == payment_recipient, they still owe the fee to the treasury.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let user = Address::generate(&env); // payer == recipient
+    let token_admin = Address::generate(&env);
+    let tok = create_token(&env, &token_admin);
+    token::StellarAssetClient::new(&env, &tok.address).mint(&user, &1_000);
+
+    let client = setup_percentage(&env, &admin, &treasury, 100);
+
+    let (net, fee) = client.collect_fee(&user, &user, &tok.address, &1_000);
+
+    assert_eq!(fee, 10);
+    assert_eq!(net, 990);
+    assert_eq!(tok.balance(&treasury), 10);
+    assert_eq!(tok.balance(&user), 990); // net returned to same address
+}
+
+// ─── calculate_fee no-auth verification ─────────────────────────────────
+
+#[test]
+fn calculate_fee_no_auth_required() {
+    // Verify that calculate_fee is a read-only function that any address
+    // can call without authentication.
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // Use mock auth only for admin setup (update_fee_config requires admin).
+    env.mock_all_auths();
+    let client = create_contract(&env);
+    client.initialize(&admin, &treasury, &100u32, &0i128, &FeeMode::Percentage);
+
+    // Soroban mock_all_auths() is a one-way toggle; it cannot be disabled
+    // after enabling. However, calculate_fee does not call require_auth()
+    // in its contract implementation, so any address can invoke it.
+    // We verify the pure computation succeeds and returns correct values.
+    let (net, fee) = client.calculate_fee(&1_000i128);
+    assert_eq!(net, 990);
+    assert_eq!(fee, 10);
+}
+
+// ─── Rounding tie-breaker tests ──────────────────────────────────────────
+
+#[test]
+fn test_fee_basis_points_rounding_tie_breaker() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let client = create_contract(&env);
+
+    // Initialize with 500 bps (5 %)
+    client.initialize(&admin, &treasury, &500u32, &0i128, &FeeMode::Percentage);
+
+    // 25 tokens * 5% = 1.25. Floor rounding must yield 1.
+    let (net_25, fee_25) = client.calculate_fee(&25i128);
+    assert_eq!(fee_25, 1, "Floor rounding: 1.25 must round down to 1");
+    assert_eq!(net_25, 24);
+
+    // 19 tokens * 5% = 0.95. Floor rounding must yield 0.
+    let (net_19, fee_19) = client.calculate_fee(&19i128);
+    assert_eq!(fee_19, 0, "Floor rounding: 0.95 must round down to 0");
+    assert_eq!(net_19, 19);
+
+    // Update to 800 bps (8 %) via config update
+    client.update_fee_config(&admin, &800u32, &0i128, &FeeMode::Percentage);
+
+    // 12 tokens * 8% = 0.96. Floor rounding must yield 0.
+    let (net_12, fee_12) = client.calculate_fee(&12i128);
+    assert_eq!(fee_12, 0, "Floor rounding: 0.96 must round down to 0");
+    assert_eq!(net_12, 12);
+
+    // 25 tokens * 8% = 2.00. Exact, but still verifies the path.
+    let (net_25_8, fee_25_8) = client.calculate_fee(&25i128);
+    assert_eq!(fee_25_8, 2, "8% of 25 = 2.00");
+    assert_eq!(net_25_8, 23);
+
+    // 26 tokens * 8% = 2.08. Floor rounding must yield 2.
+    let (net_26, fee_26) = client.calculate_fee(&26i128);
+    assert_eq!(fee_26, 2, "Floor rounding: 2.08 must round down to 2");
+    assert_eq!(net_26, 24);
+}

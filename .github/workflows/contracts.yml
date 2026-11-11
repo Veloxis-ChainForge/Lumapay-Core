@@ -1,0 +1,148 @@
+name: Contracts CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Enforcing: run_ci.py exits non-zero on any documentation failure.
+      # Pre-existing violations are recorded in tools/doc_checker/baseline.json
+      # and only warn; a NEW violation (including growth of an existing one)
+      # fails the job. Baseline entries can only change by explicitly
+      # regenerating that file (--update-baseline), which lands as a
+      # reviewable diff in the PR.
+      - name: Check contract documentation
+        run: python3 tools/doc_checker/run_ci.py
+
+      - name: Reject committed Cargo build output
+        run: bash scripts/check-no-committed-build-output.sh
+
+      # Installed via the preinstalled rustup rather than dtolnay/rust-toolchain:
+      # fetching that action from codeload intermittently returns 429 and fails
+      # the job during setup, before any of the checks below even run.
+      # clippy must be requested explicitly: --profile minimal omits it from
+      # the preinstalled component set, and the Clippy step below would fail
+      # with "'cargo-clippy' is not installed for the toolchain".
+      - name: Install Rust (nightly)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt --component clippy
+          rustup default nightly
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: onchain
+
+      - name: Check formatting
+        working-directory: onchain
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy (all workspace targets)
+        working-directory: onchain
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Reject untyped payroll traps
+        run: bash scripts/check-contract-no-traps.sh
+
+      - name: Self-test contract trap guard
+        run: bash scripts/tests/check_contract_no_traps_test.sh
+
+      - name: Build workspace
+        working-directory: onchain
+        run: cargo build --workspace --verbose
+
+      - name: Verify contract event schema fixtures
+        working-directory: onchain
+        run: cargo test -p stello_pay_contract --test event_schema_fixtures --verbose
+
+      - name: Test workspace
+        working-directory: onchain
+        run: cargo test --workspace --verbose
+
+      # Keep the native build/test signals above independent from the
+      # deployable-artifact checks below. A wasm compiler failure must be
+      # distinguishable from a size-policy failure in the Actions UI.
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build deployable WASM artifacts
+        working-directory: onchain
+        run: cargo build --workspace --release --target wasm32-unknown-unknown --verbose
+
+      - name: Prepare contract WASM inventory
+        run: |
+          set -euo pipefail
+          inventory_dir="onchain/target/wasm-size-check/release"
+          mkdir -p "$inventory_dir"
+          for contract in multisig price_oracle rbac stello_pay_contract; do
+            artifact="onchain/target/wasm32-unknown-unknown/release/${contract}.wasm"
+            test -f "$artifact" || {
+              echo "::error title=Missing WASM artifact::${artifact} was not produced" >&2
+              exit 1
+            }
+            cp "$artifact" "$inventory_dir/${contract}.wasm"
+          done
+
+      # Keep this as its own step so crossing Stellar's absolute deployment
+      # ceiling is not hidden inside the relative-regression report. Existing
+      # over-limit artifacts are grandfathered from the committed baseline;
+      # they remain tracked by the separate contract-size cleanup work. A new
+      # violation, or growth in an existing violation, still fails CI.
+      - name: Enforce Stellar contract size ceiling
+        run: |
+          set -euo pipefail
+          max_size=131072
+          failed=0
+          for artifact in onchain/target/wasm-size-check/release/*.wasm; do
+            size=$(stat -c '%s' "$artifact")
+            contract="${artifact##*/}"
+            contract="${contract%.wasm}"
+            baseline_size=$(jq -r --arg contract "$contract" '.contracts[$contract].size_bytes // empty' benchmarks/wasm_sizes.json)
+
+            if (( size <= max_size )); then
+              continue
+            fi
+
+            if [[ -z "$baseline_size" ]]; then
+              echo "::error title=New WASM exceeds Stellar limit::${artifact} is ${size} bytes; maximum is ${max_size}" >&2
+              failed=1
+            elif (( baseline_size <= max_size )); then
+              echo "::error title=WASM crossed Stellar limit::${artifact} is ${size} bytes; baseline was ${baseline_size} bytes and maximum is ${max_size}" >&2
+              failed=1
+            elif (( size > baseline_size )); then
+              echo "::error title=Oversized WASM regressed::${artifact} is ${size} bytes; baseline was ${baseline_size} bytes and maximum is ${max_size}" >&2
+              failed=1
+            else
+              echo "::warning title=Pre-existing oversized WASM::${artifact} is ${size} bytes; maximum is ${max_size}, baseline was ${baseline_size} bytes" >&2
+            fi
+          done
+          exit "$failed"
+
+      - name: Check WASM size regressions
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo run --release --manifest-path tools/wasm_size_check/Cargo.toml -- \
+            --baseline benchmarks/wasm_sizes.json \
+            --wasm-dir onchain/target/wasm-size-check/release \
+            --tolerance-pct 5 \
+            --fail-on-new \
+            --report artifacts/wasm_size_report.md
+
+      - name: Upload WASM size report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-size-report
+          path: artifacts/wasm_size_report.md
+          if-no-files-found: ignore

@@ -1,0 +1,17 @@
+[package]
+name = "compliance_reporting"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["alloc"] }
+audit_logger = { path = "../audit_logger" }
+payment_history = { path = "../payment_history" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["alloc", "testutils"] }
